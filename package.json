@@ -1,0 +1,27 @@
+{
+  "name": "rank-subdeps",
+  "version": "1.0.0",
+  "description": "Rank top-level dependencies by number of transitive subdependencies",
+  "type": "module",
+  "bin": {
+    "rank-subdeps": "bin/rank-subdeps.js"
+  },
+  "files": [
+    "bin/"
+  ],
+  "license": "MIT",
+  "author": "Ēriks Remess <eriks@remess.lv>",
+  "keywords": [
+    "npm",
+    "dependencies",
+    "subdependencies",
+    "cli",
+    "analysis"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
