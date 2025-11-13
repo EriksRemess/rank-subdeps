@@ -1,6 +1,6 @@
 {
   "name": "rank-subdeps",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Rank top-level dependencies by number of transitive subdependencies",
   "type": "module",
   "bin": {
@@ -23,5 +23,9 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "repository": "github:EriksRemess/rank-subdeps",
+  "bugs": {
+    "url": "https://github.com/EriksRemess/rank-subdeps/issues"
   }
 }
