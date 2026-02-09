@@ -21,6 +21,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
 } from 'node:fs';
@@ -450,9 +451,18 @@ function main(argv = process.argv) {
   console.log(`\nAggregate approx size (deduped by name@version): ${formatApproxBytes(aggregateApproxBytes)}`);
 }
 
+function shouldRunAsCli(moduleFilePath, argv1) {
+  if (!argv1) return false;
+  const invokedFile = resolve(argv1);
+  try {
+    return realpathSync(moduleFilePath) === realpathSync(invokedFile);
+  } catch {
+    return moduleFilePath === invokedFile;
+  }
+}
+
 const thisFile = fileURLToPath(import.meta.url);
-const invokedFile = process.argv[1] ? resolve(process.argv[1]) : '';
-if (thisFile === invokedFile) main();
+if (shouldRunAsCli(thisFile, process.argv[1])) main();
 
 export {
   collectAggregateApproxBytes,
@@ -463,4 +473,5 @@ export {
   main,
   parseArgs,
   runNpmLs,
+  shouldRunAsCli,
 };

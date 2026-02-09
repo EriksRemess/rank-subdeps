@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, writeSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -10,6 +10,7 @@ import {
   getResultsComparator,
   parseArgs,
   runNpmLs,
+  shouldRunAsCli,
 } from '../bin/rank-subdeps.js';
 
 test('runNpmLs requests --long and parses captured JSON', () => {
@@ -115,4 +116,16 @@ test('getResultsComparator sorts by selected mode', () => {
   assert.deepEqual(bySubdeps, ['beta', 'alpha', 'gamma']);
   assert.deepEqual(bySize, ['gamma', 'beta', 'alpha']);
   assert.deepEqual(byName, ['alpha', 'beta', 'gamma']);
+});
+
+test('shouldRunAsCli handles symlinked invocation paths', { skip: process.platform === 'win32' }, () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'rank-subdeps-cli-test-'));
+  const realScript = join(tmp, 'rank-subdeps.js');
+  const linkedScript = join(tmp, 'rank-subdeps-link.js');
+
+  writeFileSync(realScript, 'export {};\n', 'utf8');
+  symlinkSync(realScript, linkedScript);
+
+  assert.equal(shouldRunAsCli(realScript, linkedScript), true);
+  assert.equal(shouldRunAsCli(realScript, join(tmp, 'different.js')), false);
 });

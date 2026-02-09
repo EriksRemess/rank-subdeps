@@ -1,6 +1,6 @@
 {
   "name": "rank-subdeps",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Rank top-level dependencies by number of transitive subdependencies",
   "type": "module",
   "bin": {
