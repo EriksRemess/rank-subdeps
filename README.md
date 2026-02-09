@@ -1,6 +1,6 @@
 # rank-subdeps
 
-Rank your top-level dependencies by how many transitive subdependencies they bring in.
+Rank your top-level dependencies by how many transitive subdependencies they bring in, plus their approximate aggregate file size.
 
 ## Install
 
@@ -22,6 +22,7 @@ rank-subdeps
 |------|--------------|
 | `--json` | Output machine-readable JSON |
 | `--top N` | Show a “Top N” summary (default: 10) |
+| `--sort subdeps\|size\|name` | Sort by subdependency count (default), approximate size, or package name |
 | `--omit=<type>[,<type>]` | Omit dependency types: `dev`, `optional`, `peer` |
 | `--include=<type>[,<type>]` | Include dependency types even if omitted |
 | `-h, --help` | Show help |
@@ -29,16 +30,18 @@ rank-subdeps
 ### Example output
 
 ```
-#  name          wanted(range)  installed  types  subdeps
--  ------------- -------------- ---------- ------ -------
-1  express       ^4.19.2        4.19.2     prod   69
-2  typescript    ^5.6.2         5.6.2      dev    10
-3  chalk         ^5.3.0         5.3.0      prod   2
+#  name          wanted(range)  installed  types  subdeps  approx size
+-  ------------- -------------- ---------- ------ -------  -----------
+1  express       ^4.19.2        4.19.2     prod   69       ~2.8 MB
+2  typescript    ^5.6.2         5.6.2      dev    10       ~23 MB
+3  chalk         ^5.3.0         5.3.0      prod   2        ~94 KB
 
 Top 10 by subdependencies:
- 1. express      →  69 subdeps  (4.19.2) [prod]
- 2. typescript   →  10 subdeps  (5.6.2) [dev]
- 3. chalk        →  2 subdeps   (5.3.0) [prod]
+ 1. express      →  69 subdeps  (~2.8 MB) (4.19.2) [prod]
+ 2. typescript   →  10 subdeps  (~23 MB) (5.6.2) [dev]
+ 3. chalk        →  2 subdeps   (~94 KB) (5.3.0) [prod]
+
+Aggregate approx size (deduped by name@version): ~25 MB
 ```
 
 ## How it works
@@ -46,10 +49,12 @@ Top 10 by subdependencies:
 The CLI runs:
 
 ```bash
-npm ls --all --json
+npm ls --all --json --long
 ```
 
 It then counts **unique subdependencies** by `(name@version)` for each top-level dependency from `dependencies`, `devDependencies`, `optionalDependencies`, and `peerDependencies`.
+
+Approximate file size is derived from installed package files under `node_modules` and deduped by `(name@version)`.
 
 Filtering follows npm-style omit/include semantics:
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ESM CLI: rank-subdeps
-// Ranks top-level deps by number of unique transitive subdependencies using `npm ls --all --json`.
+// Ranks top-level deps by unique transitive subdependencies and approximate aggregate file size.
 //
 // Usage:
 //   rank-subdeps
@@ -14,9 +14,20 @@
 // - Supports npm-style omit/include filtering for dependency types.
 // - Requires an installed tree (node_modules). Run `npm i` first.
 
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  closeSync,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 function readJSON(p) {
   try {
@@ -35,21 +46,39 @@ function loadPkgJson(root) {
   return pkg;
 }
 
-function runNpmLs(root, args) {
+function runNpmLs(root, args, execRunner = execFileSync) {
   const bin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-  const npmArgs = ['ls', '--all', '--json'];
+  // `--long` is required to include `path` in npm's JSON output, which we
+  // use for approximate on-disk size calculations.
+  const npmArgs = ['ls', '--all', '--json', '--long'];
   const omitted = Array.from(args.omit).sort();
   const included = Array.from(args.include).sort();
   for (const t of omitted) npmArgs.push(`--omit=${t}`);
   for (const t of included) npmArgs.push(`--include=${t}`);
+  const captureDir = mkdtempSync(join(tmpdir(), 'rank-subdeps-'));
+  const stdoutPath = join(captureDir, 'npm-ls.json');
+  let stdoutFd = null;
   try {
-    const out = execFileSync(bin, npmArgs, {
+    stdoutFd = openSync(stdoutPath, 'w');
+    execRunner(bin, npmArgs, {
       cwd: root,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', stdoutFd, 'pipe'],
     });
+    closeSync(stdoutFd);
+    stdoutFd = null;
+    const out = readFileSync(stdoutPath, 'utf8');
     return JSON.parse(out.toString('utf8'));
   } catch (err) {
-    const stdout = err?.stdout?.toString('utf8');
+    if (stdoutFd !== null) {
+      try {
+        closeSync(stdoutFd);
+      } catch {}
+      stdoutFd = null;
+    }
+    let stdout = '';
+    try {
+      stdout = readFileSync(stdoutPath, 'utf8');
+    } catch {}
     if (stdout) {
       try {
         return JSON.parse(stdout);
@@ -58,20 +87,104 @@ function runNpmLs(root, args) {
     console.error('Failed to run "npm ls --all --json".');
     if (err?.stderr) console.error(String(err.stderr));
     process.exit(1);
+  } finally {
+    if (stdoutFd !== null) {
+      try {
+        closeSync(stdoutFd);
+      } catch {}
+    }
+    rmSync(captureDir, { recursive: true, force: true });
   }
 }
 
 const makeId = (name, version) => `${name}@${version || 'UNKNOWN'}`;
 
-function collectUniqueSubdeps(node) {
-  // Collect unique (name@version) for all descendants of `node`
+function getApproxPathSize(path, pathSizeCache) {
+  if (!path) return 0;
+  const cached = pathSizeCache.get(path);
+  if (cached !== undefined) return cached;
+
+  let total = 0;
+  const stack = [path];
+
+  while (stack.length) {
+    const curPath = stack.pop();
+    let stat;
+    try {
+      stat = lstatSync(curPath);
+    } catch {
+      continue;
+    }
+
+    if (stat.isSymbolicLink()) continue;
+    if (stat.isFile()) {
+      total += stat.size;
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+
+    let entries;
+    try {
+      entries = readdirSync(curPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const entryPath = join(curPath, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(entryPath);
+      } else if (entry.isFile()) {
+        try {
+          total += statSync(entryPath).size;
+        } catch {}
+      } else if (!entry.isSymbolicLink()) {
+        try {
+          const entryStat = statSync(entryPath);
+          if (entryStat.isFile()) total += entryStat.size;
+        } catch {}
+      }
+    }
+  }
+
+  pathSizeCache.set(path, total);
+  return total;
+}
+
+function collectSubtreeStats(name, node, pathSizeCache) {
+  // Collect unique (name@version) for this dependency subtree.
+  // `subdeps` excludes the top-level dependency itself.
+  if (!node) return { subdeps: 0, approxBytes: 0 };
+
   const seen = new Set();
+  let approxBytes = 0;
+  const stack = [[name, node]];
+
+  while (stack.length) {
+    const [curName, cur] = stack.pop();
+    const id = makeId(curName, cur?.version);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    approxBytes += getApproxPathSize(cur?.path, pathSizeCache);
+
+    if (cur && cur.dependencies) {
+      for (const [n2, c2] of Object.entries(cur.dependencies)) {
+        stack.push([n2, c2]);
+      }
+    }
+  }
+
+  return { subdeps: Math.max(0, seen.size - 1), approxBytes };
+}
+
+function collectAggregateApproxBytes(tree, topDepNames, pathSizeCache) {
+  const seen = new Set();
+  let total = 0;
   const stack = [];
 
-  if (!node || !node.dependencies) return seen;
-
-  for (const [name, child] of Object.entries(node.dependencies)) {
-    stack.push([name, child]);
+  for (const name of topDepNames) {
+    const node = tree.dependencies?.[name];
+    if (node) stack.push([name, node]);
   }
 
   while (stack.length) {
@@ -79,13 +192,31 @@ function collectUniqueSubdeps(node) {
     const id = makeId(name, cur?.version);
     if (seen.has(id)) continue;
     seen.add(id);
+    total += getApproxPathSize(cur?.path, pathSizeCache);
+
     if (cur && cur.dependencies) {
       for (const [n2, c2] of Object.entries(cur.dependencies)) {
         stack.push([n2, c2]);
       }
     }
   }
-  return seen;
+
+  return total;
+}
+
+function formatApproxBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '~0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unitIdx = 0;
+
+  while (value >= 1024 && unitIdx < units.length - 1) {
+    value /= 1024;
+    unitIdx++;
+  }
+
+  const text = value >= 10 || unitIdx === 0 ? String(Math.round(value)) : value.toFixed(1);
+  return `~${text} ${units[unitIdx]}`;
 }
 
 const pad = (str, len) => {
@@ -97,11 +228,13 @@ function parseArgs(argv) {
   const args = {
     json: false,
     top: 10,
+    sort: 'subdeps',
     // npm-like default: omit dev when NODE_ENV=production
     omit: new Set(process.env.NODE_ENV === 'production' ? ['dev'] : []),
     include: new Set(),
   };
   const allowedTypes = new Set(['dev', 'optional', 'peer']);
+  const allowedSorts = new Set(['subdeps', 'size', 'name']);
   const addTypes = (raw, flag) => {
     if (!raw || raw.startsWith('-')) {
       console.error(`Missing value for ${flag}. Supported values: dev, optional, peer`);
@@ -124,6 +257,18 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '--json') {
       args.json = true;
+    } else if (a === '--sort' || a.startsWith('--sort=')) {
+      const raw = a === '--sort' ? argv[i + 1] : a.slice('--sort='.length);
+      if (!raw || raw.startsWith('-')) {
+        console.error('Missing value for --sort. Supported values: subdeps, size, name');
+        printHelpAndExit(1);
+      }
+      if (!allowedSorts.has(raw)) {
+        console.error(`Unsupported --sort value: ${raw}`);
+        printHelpAndExit(1);
+      }
+      args.sort = raw;
+      if (a === '--sort') i++;
     } else if (a === '--top') {
       const n = Number(argv[i + 1]);
       if (!Number.isNaN(n) && n > 0) args.top = n;
@@ -155,14 +300,15 @@ function parseArgs(argv) {
 function printHelpAndExit(code = 0) {
   console.log(`rank-subdeps
 
-Rank top-level dependencies by unique transitive subdependencies.
+Rank top-level dependencies by unique transitive subdependencies and approximate file size.
 
 Usage:
-  rank-subdeps [--json] [--top N] [--omit=<type>[,<type>]] [--include=<type>[,<type>]]
+  rank-subdeps [--json] [--top N] [--sort subdeps|size|name] [--omit=<type>[,<type>]] [--include=<type>[,<type>]]
 
 Options:
-  --json        Output machine-readable JSON instead of a table
+  --json        Output machine-readable JSON instead of a table (includes aggregateApproxBytes)
   --top N       Number of items to include in the "Top N" summary (default: 10)
+  --sort        Sort by subdependency count (subdeps), approx size (size), or package name (name)
   --omit        Dependency types to omit: dev, optional, peer (can be repeated)
   --include     Dependency types to include even if omitted (can be repeated)
   -h, --help    Show this help
@@ -170,8 +316,27 @@ Options:
   process.exit(code);
 }
 
-(function main() {
-  const args = parseArgs(process.argv);
+function getResultsComparator(sortMode) {
+  if (sortMode === 'size') {
+    return (a, b) =>
+      b.approxBytes - a.approxBytes ||
+      b.subdeps - a.subdeps ||
+      a.name.localeCompare(b.name);
+  }
+  if (sortMode === 'name') {
+    return (a, b) =>
+      a.name.localeCompare(b.name) ||
+      b.subdeps - a.subdeps ||
+      b.approxBytes - a.approxBytes;
+  }
+  return (a, b) =>
+    b.subdeps - a.subdeps ||
+    b.approxBytes - a.approxBytes ||
+    a.name.localeCompare(b.name);
+}
+
+function main(argv = process.argv) {
+  const args = parseArgs(argv);
   const root = process.cwd();
   const pkg = loadPkgJson(root);
   const tree = runNpmLs(root, args);
@@ -212,6 +377,7 @@ Options:
   }
 
   const results = [];
+  const pathSizeCache = new Map();
 
   for (const [name, meta] of Object.entries(topDeps)) {
     const types = ['prod', 'dev', 'optional', 'peer'].filter(t => meta.types.has(t));
@@ -223,30 +389,33 @@ Options:
         installed: 'NOT INSTALLED',
         types,
         subdeps: 0,
+        approxBytes: 0,
       });
       continue;
     }
 
-    const uniqueSub = collectUniqueSubdeps(node);
+    const stats = collectSubtreeStats(name, node, pathSizeCache);
     results.push({
       name,
       wanted: meta.wanted,
       installed: node.version || 'UNKNOWN',
       types,
-      subdeps: uniqueSub.size,
+      subdeps: stats.subdeps,
+      approxBytes: stats.approxBytes,
     });
   }
 
-  results.sort((a, b) => b.subdeps - a.subdeps || a.name.localeCompare(b.name));
+  results.sort(getResultsComparator(args.sort));
+  const aggregateApproxBytes = collectAggregateApproxBytes(tree, Object.keys(topDeps), pathSizeCache);
 
   if (args.json) {
     // JSON mode: full dataset
-    console.log(JSON.stringify({ results }, null, 2));
+    console.log(JSON.stringify({ results, aggregateApproxBytes }, null, 2));
     return;
   }
 
   // Pretty table
-  const header = ['#', 'name', 'wanted(range)', 'installed', 'types', 'subdeps'];
+  const header = ['#', 'name', 'wanted(range)', 'installed', 'types', 'subdeps', 'approx size'];
   const rows = [header];
 
   results.forEach((r, idx) => {
@@ -257,6 +426,7 @@ Options:
       r.installed,
       r.types.join(','),
       String(r.subdeps),
+      formatApproxBytes(r.approxBytes),
     ]);
   });
 
@@ -269,10 +439,28 @@ Options:
 
   const topN = results.slice(0, args.top);
   const maxNameLen = Math.max(...topN.map(x => x.name.length), 4);
-  console.log(`\nTop ${args.top} by subdependencies:`);
+  const topLabel = args.sort === 'size' ? 'approx size' : args.sort === 'name' ? 'name' : 'subdependencies';
+  console.log(`\nTop ${args.top} by ${topLabel}:`);
   topN.forEach((r, i) => {
     console.log(
-      `${String(i + 1).padStart(2, ' ')}. ${pad(r.name, maxNameLen)}  →  ${r.subdeps} subdeps  (${r.installed}) [${r.types.join(',')}]`
+      `${String(i + 1).padStart(2, ' ')}. ${pad(r.name, maxNameLen)}  →  ${r.subdeps} subdeps  (${formatApproxBytes(r.approxBytes)}) (${r.installed}) [${r.types.join(',')}]`
     );
   });
-})();
+
+  console.log(`\nAggregate approx size (deduped by name@version): ${formatApproxBytes(aggregateApproxBytes)}`);
+}
+
+const thisFile = fileURLToPath(import.meta.url);
+const invokedFile = process.argv[1] ? resolve(process.argv[1]) : '';
+if (thisFile === invokedFile) main();
+
+export {
+  collectAggregateApproxBytes,
+  collectSubtreeStats,
+  formatApproxBytes,
+  getApproxPathSize,
+  getResultsComparator,
+  main,
+  parseArgs,
+  runNpmLs,
+};
