@@ -98,6 +98,35 @@ function runNpmLs(root, args, execRunner = execFileSync) {
   }
 }
 
+function runNpmOutdated(root, args, execRunner = execFileSync) {
+  const bin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const npmArgs = ['outdated', '--all', '--json'];
+  const omitted = Array.from(args.omit).sort();
+  const included = Array.from(args.include).sort();
+  for (const t of omitted) npmArgs.push(`--omit=${t}`);
+  for (const t of included) npmArgs.push(`--include=${t}`);
+
+  try {
+    const out = execRunner(bin, npmArgs, {
+      cwd: root,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const text = String(out || '').trim();
+    return text ? JSON.parse(text) : {};
+  } catch (err) {
+    const stdout = String(err?.stdout || '').trim();
+    if (stdout) {
+      try {
+        return JSON.parse(stdout);
+      } catch {}
+    }
+
+    // `npm outdated` may fail for registry/auth/network reasons; keep the main
+    // report usable and mark outdated counts as unavailable.
+    return null;
+  }
+}
+
 const makeId = (name, version) => `${name}@${version || 'UNKNOWN'}`;
 
 function getApproxPathSize(path, pathSizeCache) {
@@ -152,30 +181,72 @@ function getApproxPathSize(path, pathSizeCache) {
   return total;
 }
 
-function collectSubtreeStats(name, node, pathSizeCache) {
+function collectSubtreeStats(name, node, pathSizeCache, outdatedMarkers = null) {
   // Collect unique (name@version) for this dependency subtree.
   // `subdeps` excludes the top-level dependency itself.
-  if (!node) return { subdeps: 0, approxBytes: 0 };
+  if (!node) return { subdeps: 0, outdatedSubdeps: 0, approxBytes: 0 };
 
   const seen = new Set();
+  let outdatedSubdeps = 0;
   let approxBytes = 0;
-  const stack = [[name, node]];
+  const stack = [[name, node, 0]];
 
   while (stack.length) {
-    const [curName, cur] = stack.pop();
+    const [curName, cur, depth] = stack.pop();
     const id = makeId(curName, cur?.version);
     if (seen.has(id)) continue;
     seen.add(id);
     approxBytes += getApproxPathSize(cur?.path, pathSizeCache);
+    if (depth > 0 && isOutdatedNode(curName, cur, outdatedMarkers)) outdatedSubdeps++;
 
     if (cur && cur.dependencies) {
       for (const [n2, c2] of Object.entries(cur.dependencies)) {
-        stack.push([n2, c2]);
+        stack.push([n2, c2, depth + 1]);
       }
     }
   }
 
-  return { subdeps: Math.max(0, seen.size - 1), approxBytes };
+  return { subdeps: Math.max(0, seen.size - 1), outdatedSubdeps, approxBytes };
+}
+
+function collectOutdatedMarkers(root, outdatedJson) {
+  const paths = new Set();
+  const ids = new Set();
+  if (!outdatedJson || typeof outdatedJson !== 'object') return { paths, ids };
+
+  const visit = (value, keyHint = null) => {
+    if (!value || typeof value !== 'object') return;
+
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, null);
+      return;
+    }
+
+    const isEntry =
+      typeof value.current === 'string' &&
+      (typeof value.latest === 'string' || typeof value.wanted === 'string' || value.latest === null);
+
+    if (isEntry) {
+      const name = typeof value.name === 'string' ? value.name : keyHint;
+      if (name) ids.add(makeId(name, value.current));
+      if (typeof value.location === 'string' && value.location) {
+        paths.add(resolve(root, value.location));
+      }
+    }
+
+    for (const [k, v] of Object.entries(value)) {
+      if (v && typeof v === 'object') visit(v, k);
+    }
+  };
+
+  visit(outdatedJson);
+  return { paths, ids };
+}
+
+function isOutdatedNode(name, node, outdatedMarkers) {
+  if (!outdatedMarkers) return false;
+  if (node?.path && outdatedMarkers.paths.has(resolve(node.path))) return true;
+  return outdatedMarkers.ids.has(makeId(name, node?.version));
 }
 
 function collectAggregateApproxBytes(tree, topDepNames, pathSizeCache) {
@@ -341,6 +412,9 @@ function main(argv = process.argv) {
   const root = process.cwd();
   const pkg = loadPkgJson(root);
   const tree = runNpmLs(root, args);
+  const outdatedJson = runNpmOutdated(root, args);
+  const outdatedMarkers = collectOutdatedMarkers(root, outdatedJson);
+  const outdatedCountsAvailable = outdatedJson !== null;
 
   const topDepsMap = new Map();
   const addTopDeps = (depsObj, type) => {
@@ -390,18 +464,20 @@ function main(argv = process.argv) {
         installed: 'NOT INSTALLED',
         types,
         subdeps: 0,
+        outdatedSubdeps: outdatedCountsAvailable ? 0 : null,
         approxBytes: 0,
       });
       continue;
     }
 
-    const stats = collectSubtreeStats(name, node, pathSizeCache);
+    const stats = collectSubtreeStats(name, node, pathSizeCache, outdatedMarkers);
     results.push({
       name,
       wanted: meta.wanted,
       installed: node.version || 'UNKNOWN',
       types,
       subdeps: stats.subdeps,
+      outdatedSubdeps: outdatedCountsAvailable ? stats.outdatedSubdeps : null,
       approxBytes: stats.approxBytes,
     });
   }
@@ -416,7 +492,7 @@ function main(argv = process.argv) {
   }
 
   // Pretty table
-  const header = ['#', 'name', 'wanted(range)', 'installed', 'types', 'subdeps', 'approx size'];
+  const header = ['#', 'name', 'wanted(range)', 'installed', 'types', 'subdeps', 'outdated', 'approx size'];
   const rows = [header];
 
   results.forEach((r, idx) => {
@@ -427,6 +503,7 @@ function main(argv = process.argv) {
       r.installed,
       r.types.join(','),
       String(r.subdeps),
+      r.outdatedSubdeps == null ? '?' : String(r.outdatedSubdeps),
       formatApproxBytes(r.approxBytes),
     ]);
   });
@@ -437,6 +514,9 @@ function main(argv = process.argv) {
   console.log(line(rows[0]));
   console.log(widths.map(w => '-'.repeat(w)).join('  '));
   for (let i = 1; i < rows.length; i++) console.log(line(rows[i]));
+  if (!outdatedCountsAvailable) {
+    console.log('\nNote: outdated counts unavailable (npm outdated failed).');
+  }
 
   const topN = results.slice(0, args.top);
   const maxNameLen = Math.max(...topN.map(x => x.name.length), 4);
@@ -466,12 +546,15 @@ if (shouldRunAsCli(thisFile, process.argv[1])) main();
 
 export {
   collectAggregateApproxBytes,
+  collectOutdatedMarkers,
   collectSubtreeStats,
   formatApproxBytes,
   getApproxPathSize,
   getResultsComparator,
+  isOutdatedNode,
   main,
   parseArgs,
   runNpmLs,
+  runNpmOutdated,
   shouldRunAsCli,
 };

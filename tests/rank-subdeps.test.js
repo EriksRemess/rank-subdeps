@@ -6,10 +6,12 @@ import { join } from 'node:path';
 
 import {
   collectAggregateApproxBytes,
+  collectOutdatedMarkers,
   collectSubtreeStats,
   getResultsComparator,
   parseArgs,
   runNpmLs,
+  runNpmOutdated,
   shouldRunAsCli,
 } from '../bin/rank-subdeps.js';
 
@@ -81,15 +83,81 @@ test('collects subtree and aggregate bytes with dedupe by name@version', () => {
   };
 
   const cache = new Map();
-  const betaStats = collectSubtreeStats('beta', tree.dependencies.beta, cache);
-  const gammaStats = collectSubtreeStats('gamma', tree.dependencies.gamma, cache);
+  const outdatedMarkers = {
+    paths: new Set([join(root, 'node_modules', 'shared')]),
+    ids: new Set(),
+  };
+  const betaStats = collectSubtreeStats('beta', tree.dependencies.beta, cache, outdatedMarkers);
+  const gammaStats = collectSubtreeStats('gamma', tree.dependencies.gamma, cache, outdatedMarkers);
   const aggregate = collectAggregateApproxBytes(tree, ['alpha', 'beta', 'gamma'], cache);
 
   assert.equal(betaStats.subdeps, 1);
   assert.equal(gammaStats.subdeps, 1);
+  assert.equal(betaStats.outdatedSubdeps, 1);
+  assert.equal(gammaStats.outdatedSubdeps, 1);
   assert.equal(betaStats.approxBytes, 60);
   assert.equal(gammaStats.approxBytes, 70);
   assert.equal(aggregate, 100);
+});
+
+test('collectOutdatedMarkers parses npm outdated JSON entries recursively', () => {
+  const root = '/tmp/project';
+  const parsed = collectOutdatedMarkers(root, {
+    chalk: {
+      current: '5.3.0',
+      wanted: '5.6.2',
+      latest: '5.6.2',
+      location: 'node_modules/chalk',
+    },
+    nested: {
+      entries: [
+        {
+          name: 'ansi-styles',
+          current: '6.2.1',
+          latest: '6.3.0',
+          location: 'node_modules/chalk/node_modules/ansi-styles',
+        },
+      ],
+    },
+  });
+
+  assert.equal(parsed.ids.has('chalk@5.3.0'), true);
+  assert.equal(parsed.ids.has('ansi-styles@6.2.1'), true);
+  assert.equal(parsed.paths.has(join(root, 'node_modules', 'chalk')), true);
+  assert.equal(parsed.paths.has(join(root, 'node_modules', 'chalk', 'node_modules', 'ansi-styles')), true);
+});
+
+test('runNpmOutdated parses JSON from non-zero exit with stdout', () => {
+  const root = mkdtempSync(join(tmpdir(), 'rank-subdeps-outdated-test-'));
+  const args = {
+    omit: new Set(['optional', 'dev']),
+    include: new Set(['peer']),
+  };
+
+  let seenBin = null;
+  let seenArgs = null;
+  const fakeExec = (bin, npmArgs) => {
+    seenBin = bin;
+    seenArgs = npmArgs;
+    const err = new Error('outdated found');
+    err.stdout = Buffer.from(JSON.stringify({
+      chalk: {
+        current: '5.3.0',
+        latest: '5.6.2',
+        location: 'node_modules/chalk',
+      },
+    }));
+    throw err;
+  };
+
+  const outdated = runNpmOutdated(root, args, fakeExec);
+
+  assert.ok(seenBin === 'npm' || seenBin === 'npm.cmd');
+  assert.deepEqual(
+    seenArgs,
+    ['outdated', '--all', '--json', '--omit=dev', '--omit=optional', '--include=peer']
+  );
+  assert.equal(outdated.chalk.current, '5.3.0');
 });
 
 test('parseArgs supports --sort value and --sort=value', () => {
