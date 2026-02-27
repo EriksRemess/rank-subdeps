@@ -22,7 +22,8 @@ rank-subdeps
 |------|--------------|
 | `--json` | Output machine-readable JSON (includes `outdatedSubdeps` and `lastUpdated` (latest publish time) per result) |
 | `--top N` | Show a “Top N” summary (default: 10) |
-| `--sort subdeps\|size\|name` | Sort by subdependency count (default), approximate size, or package name |
+| `--sort subdeps\|size\|name\|publish` | Sort by subdependency count, approximate size, package name, or publish date |
+| `--direction asc\|desc` | Sort direction for the selected `--sort` field (defaults: `subdeps/size/publish=desc`, `name=asc`) |
 | `--omit=<type>[,<type>]` | Omit dependency types: `dev`, `optional`, `peer` |
 | `--include=<type>[,<type>]` | Include dependency types even if omitted |
 | `-h, --help` | Show help |

@@ -358,6 +358,18 @@ function formatLastUpdated(value) {
   return date.toISOString().slice(0, 10);
 }
 
+function getPublishTimestamp(value) {
+  if (typeof value !== 'string' || !value) return null;
+  const ts = Date.parse(value);
+  return Number.isFinite(ts) ? ts : null;
+}
+
+function getEffectiveSortDirection(sortMode, direction) {
+  if (direction === 'asc' || direction === 'desc') return direction;
+  if (sortMode === 'name') return 'asc';
+  return 'desc';
+}
+
 const pad = (str, len) => {
   str = String(str);
   return str.length >= len ? str : str + ' '.repeat(len - str.length);
@@ -368,12 +380,14 @@ function parseArgs(argv) {
     json: false,
     top: 10,
     sort: 'subdeps',
+    direction: null,
     // npm-like default: omit dev when NODE_ENV=production
     omit: new Set(process.env.NODE_ENV === 'production' ? ['dev'] : []),
     include: new Set(),
   };
   const allowedTypes = new Set(['dev', 'optional', 'peer']);
-  const allowedSorts = new Set(['subdeps', 'size', 'name']);
+  const allowedSorts = new Set(['subdeps', 'size', 'name', 'publish']);
+  const allowedDirections = new Set(['asc', 'desc']);
   const addTypes = (raw, flag) => {
     if (!raw || raw.startsWith('-')) {
       console.error(`Missing value for ${flag}. Supported values: dev, optional, peer`);
@@ -399,15 +413,33 @@ function parseArgs(argv) {
     } else if (a === '--sort' || a.startsWith('--sort=')) {
       const raw = a === '--sort' ? argv[i + 1] : a.slice('--sort='.length);
       if (!raw || raw.startsWith('-')) {
-        console.error('Missing value for --sort. Supported values: subdeps, size, name');
+        console.error(
+          'Missing value for --sort. Supported values: subdeps, size, name, publish'
+        );
         printHelpAndExit(1);
       }
-      if (!allowedSorts.has(raw)) {
+      if (raw === 'publish-asc' || raw === 'publish-desc') {
+        args.sort = 'publish';
+        if (!args.direction) args.direction = raw.endsWith('-asc') ? 'asc' : 'desc';
+      } else if (!allowedSorts.has(raw)) {
         console.error(`Unsupported --sort value: ${raw}`);
         printHelpAndExit(1);
+      } else {
+        args.sort = raw;
       }
-      args.sort = raw;
       if (a === '--sort') i++;
+    } else if (a === '--direction' || a.startsWith('--direction=')) {
+      const raw = a === '--direction' ? argv[i + 1] : a.slice('--direction='.length);
+      if (!raw || raw.startsWith('-')) {
+        console.error('Missing value for --direction. Supported values: asc, desc');
+        printHelpAndExit(1);
+      }
+      if (!allowedDirections.has(raw)) {
+        console.error(`Unsupported --direction value: ${raw}`);
+        printHelpAndExit(1);
+      }
+      args.direction = raw;
+      if (a === '--direction') i++;
     } else if (a === '--top') {
       const n = Number(argv[i + 1]);
       if (!Number.isNaN(n) && n > 0) args.top = n;
@@ -442,12 +474,13 @@ function printHelpAndExit(code = 0) {
 Rank top-level dependencies by unique transitive subdependencies, latest publish date, and approximate file size.
 
 Usage:
-  rank-subdeps [--json] [--top N] [--sort subdeps|size|name] [--omit=<type>[,<type>]] [--include=<type>[,<type>]]
+  rank-subdeps [--json] [--top N] [--sort subdeps|size|name|publish] [--direction asc|desc] [--omit=<type>[,<type>]] [--include=<type>[,<type>]]
 
 Options:
   --json        Output machine-readable JSON instead of a table (includes lastUpdated and aggregateApproxBytes)
   --top N       Number of items to include in the "Top N" summary (default: 10)
-  --sort        Sort by subdependency count (subdeps), approx size (size), or package name (name)
+  --sort        Sort by subdeps, size, name, or publish date
+  --direction   Sort direction for selected --sort: asc or desc
   --omit        Dependency types to omit: dev, optional, peer (can be repeated)
   --include     Dependency types to include even if omitted (can be repeated)
   -h, --help    Show this help
@@ -455,21 +488,42 @@ Options:
   process.exit(code);
 }
 
-function getResultsComparator(sortMode) {
+function getResultsComparator(sortMode, direction = null) {
+  const effectiveDirection = getEffectiveSortDirection(sortMode, direction);
+  const asc = effectiveDirection === 'asc';
+
+  if (sortMode === 'publish') {
+    return (a, b) => {
+      const aTs = getPublishTimestamp(a.lastUpdated);
+      const bTs = getPublishTimestamp(b.lastUpdated);
+
+      if (aTs == null && bTs == null) {
+        return b.subdeps - a.subdeps || b.approxBytes - a.approxBytes || a.name.localeCompare(b.name);
+      }
+      if (aTs == null) return 1;
+      if (bTs == null) return -1;
+      return (
+        (asc ? aTs - bTs : bTs - aTs) ||
+        b.subdeps - a.subdeps ||
+        b.approxBytes - a.approxBytes ||
+        a.name.localeCompare(b.name)
+      );
+    };
+  }
   if (sortMode === 'size') {
     return (a, b) =>
-      b.approxBytes - a.approxBytes ||
+      (asc ? a.approxBytes - b.approxBytes : b.approxBytes - a.approxBytes) ||
       b.subdeps - a.subdeps ||
       a.name.localeCompare(b.name);
   }
   if (sortMode === 'name') {
     return (a, b) =>
-      a.name.localeCompare(b.name) ||
+      (asc ? a.name.localeCompare(b.name) : b.name.localeCompare(a.name)) ||
       b.subdeps - a.subdeps ||
       b.approxBytes - a.approxBytes;
   }
   return (a, b) =>
-    b.subdeps - a.subdeps ||
+    (asc ? a.subdeps - b.subdeps : b.subdeps - a.subdeps) ||
     b.approxBytes - a.approxBytes ||
     a.name.localeCompare(b.name);
 }
@@ -552,7 +606,7 @@ function main(argv = process.argv) {
     });
   }
 
-  results.sort(getResultsComparator(args.sort));
+  results.sort(getResultsComparator(args.sort, args.direction));
   const aggregateApproxBytes = collectAggregateApproxBytes(tree, Object.keys(topDeps), pathSizeCache);
 
   if (args.json) {
@@ -601,7 +655,15 @@ function main(argv = process.argv) {
 
   const topN = results.slice(0, args.top);
   const maxNameLen = Math.max(...topN.map(x => x.name.length), 4);
-  const topLabel = args.sort === 'size' ? 'approx size' : args.sort === 'name' ? 'name' : 'subdependencies';
+  const effectiveDirection = getEffectiveSortDirection(args.sort, args.direction);
+  const topLabel =
+    args.sort === 'size'
+      ? `approx size (${effectiveDirection})`
+      : args.sort === 'name'
+        ? `name (${effectiveDirection})`
+        : args.sort === 'publish'
+          ? `publish date (${effectiveDirection})`
+          : `subdependencies (${effectiveDirection})`;
   console.log(`\nTop ${args.top} by ${topLabel}:`);
   topN.forEach((r, i) => {
     console.log(

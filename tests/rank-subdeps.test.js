@@ -214,30 +214,56 @@ test('formatLastUpdated uses YYYY-MM-DD and fallback markers', () => {
   assert.equal(formatLastUpdated(null), '?');
 });
 
-test('parseArgs supports --sort value and --sort=value', () => {
+test('parseArgs supports sort + universal direction, with legacy publish aliases', () => {
   const withEquals = parseArgs(['node', 'rank-subdeps.js', '--sort=size']);
   const withSpace = parseArgs(['node', 'rank-subdeps.js', '--sort', 'name']);
+  const publishAsc = parseArgs(['node', 'rank-subdeps.js', '--sort=publish', '--direction=asc']);
+  const publishDesc = parseArgs(['node', 'rank-subdeps.js', '--sort', 'publish', '--direction', 'desc']);
+  const legacyPublishAsc = parseArgs(['node', 'rank-subdeps.js', '--sort=publish-asc']);
+  const legacyPublishDesc = parseArgs(['node', 'rank-subdeps.js', '--sort', 'publish-desc']);
   const defaultSort = parseArgs(['node', 'rank-subdeps.js']);
 
   assert.equal(withEquals.sort, 'size');
+  assert.equal(withEquals.direction, null);
   assert.equal(withSpace.sort, 'name');
+  assert.equal(withSpace.direction, null);
+  assert.equal(publishAsc.sort, 'publish');
+  assert.equal(publishAsc.direction, 'asc');
+  assert.equal(publishDesc.sort, 'publish');
+  assert.equal(publishDesc.direction, 'desc');
+  assert.equal(legacyPublishAsc.sort, 'publish');
+  assert.equal(legacyPublishAsc.direction, 'asc');
+  assert.equal(legacyPublishDesc.sort, 'publish');
+  assert.equal(legacyPublishDesc.direction, 'desc');
   assert.equal(defaultSort.sort, 'subdeps');
+  assert.equal(defaultSort.direction, null);
 });
 
 test('getResultsComparator sorts by selected mode', () => {
   const sample = [
-    { name: 'beta', subdeps: 3, approxBytes: 80 },
-    { name: 'alpha', subdeps: 3, approxBytes: 10 },
-    { name: 'gamma', subdeps: 1, approxBytes: 120 },
+    { name: 'beta', subdeps: 3, approxBytes: 80, lastUpdated: '2025-09-08T14:47:54.486Z' },
+    { name: 'alpha', subdeps: 3, approxBytes: 10, lastUpdated: '2024-12-01T10:00:00.000Z' },
+    { name: 'gamma', subdeps: 1, approxBytes: 120, lastUpdated: null },
+    { name: 'delta', subdeps: 2, approxBytes: 30, lastUpdated: '2026-01-01T00:00:00.000Z' },
   ];
 
   const bySubdeps = [...sample].sort(getResultsComparator('subdeps')).map(x => x.name);
+  const bySubdepsAsc = [...sample].sort(getResultsComparator('subdeps', 'asc')).map(x => x.name);
   const bySize = [...sample].sort(getResultsComparator('size')).map(x => x.name);
+  const bySizeAsc = [...sample].sort(getResultsComparator('size', 'asc')).map(x => x.name);
   const byName = [...sample].sort(getResultsComparator('name')).map(x => x.name);
+  const byNameDesc = [...sample].sort(getResultsComparator('name', 'desc')).map(x => x.name);
+  const byPublishAsc = [...sample].sort(getResultsComparator('publish', 'asc')).map(x => x.name);
+  const byPublishDesc = [...sample].sort(getResultsComparator('publish', 'desc')).map(x => x.name);
 
-  assert.deepEqual(bySubdeps, ['beta', 'alpha', 'gamma']);
-  assert.deepEqual(bySize, ['gamma', 'beta', 'alpha']);
-  assert.deepEqual(byName, ['alpha', 'beta', 'gamma']);
+  assert.deepEqual(bySubdeps, ['beta', 'alpha', 'delta', 'gamma']);
+  assert.deepEqual(bySubdepsAsc, ['gamma', 'delta', 'beta', 'alpha']);
+  assert.deepEqual(bySize, ['gamma', 'beta', 'delta', 'alpha']);
+  assert.deepEqual(bySizeAsc, ['alpha', 'delta', 'beta', 'gamma']);
+  assert.deepEqual(byName, ['alpha', 'beta', 'delta', 'gamma']);
+  assert.deepEqual(byNameDesc, ['gamma', 'delta', 'beta', 'alpha']);
+  assert.deepEqual(byPublishAsc, ['alpha', 'beta', 'delta', 'gamma']);
+  assert.deepEqual(byPublishDesc, ['delta', 'beta', 'alpha', 'gamma']);
 });
 
 test('shouldRunAsCli handles symlinked invocation paths', { skip: process.platform === 'win32' }, () => {
