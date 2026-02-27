@@ -1,6 +1,6 @@
 # rank-subdeps
 
-Rank your top-level dependencies by how many transitive subdependencies they bring in, how many of those are outdated, when direct dependencies were last published, and their approximate aggregate file size.
+Rank your top-level dependencies by how many transitive subdependencies they bring in, how many of those are outdated, how many have audit issues (with severity), the latest available direct version, when direct dependencies were last published, and their approximate aggregate file size.
 
 ## Install
 
@@ -20,7 +20,7 @@ rank-subdeps
 
 | Flag | Description |
 |------|--------------|
-| `--json` | Output machine-readable JSON (includes `outdatedSubdeps` and `lastUpdated` (latest publish time) per result) |
+| `--json` | Output machine-readable JSON (includes `latest`, `outdatedSubdeps`, `auditSubdeps`, and `lastUpdated` (latest publish time) per result) |
 | `--top N` | Show a “Top N” summary (default: 10) |
 | `--sort subdeps\|size\|name\|publish` | Sort by subdependency count, approximate size, package name, or publish date |
 | `--direction asc\|desc` | Sort direction for the selected `--sort` field (defaults: `subdeps/size/publish=desc`, `name=asc`) |
@@ -31,11 +31,11 @@ rank-subdeps
 ### Example output
 
 ```
-#  name          wanted(range)  installed  last published  types  subdeps  outdated  approx size
--  ------------- -------------- ---------- --------------  ------ -------  --------  -----------
-1  express       ^4.19.2        4.19.2     2025-12-01      prod   69       12        ~2.8 MB
-2  typescript    ^5.6.2         5.6.2      2025-10-10      dev    10       0         ~23 MB
-3  chalk         ^5.3.0         5.3.0      2025-09-08      prod   2        1         ~94 KB
+#  name          wanted  latest  installed  last published  types  subdeps  outdated  audit         approx size
+-  ------------- ------- ------- ---------- --------------  ------ -------  --------  ------------  -----------
+1  express       ^4.19.2 4.21.0  4.19.2     2025-12-01      prod   69       12        4 (critical)  ~2.8 MB
+2  typescript    ^5.6.2  5.6.2   5.6.2      2025-10-10      dev    10       0         0             ~23 MB
+3  chalk         ^5.3.0  5.6.2   5.3.0      2025-09-08      prod   2        1         1 (moderate)  ~94 KB
 
 Top 10 by subdependencies:
  1. express      →  69 subdeps  (~2.8 MB) (4.19.2) [prod]
@@ -52,6 +52,7 @@ The CLI runs:
 ```bash
 npm ls --all --json --long
 npm outdated --all --json
+npm audit --all --json
 npm view <package> dist-tags.latest time --json
 ```
 
@@ -59,11 +60,15 @@ It then counts **unique subdependencies** by `(name@version)` for each top-level
 
 It also counts how many unique transitive subdependencies in each subtree are outdated (based on `npm outdated` output).
 
+It also counts unique transitive subdependencies with `npm audit` findings and shows the highest severity per subtree in the `audit` column.
+
 The `last published` column is sourced from the publish timestamp of each direct dependency's npm `latest` dist-tag version.
 
 Approximate file size is derived from installed package files under `node_modules` and deduped by `(name@version)`.
 
 If `npm outdated` fails (for example due to registry/auth/network issues), the main report still works and the `outdated` column is shown as `?`.
+
+If `npm audit` fails (for example due to registry/auth/network issues), the main report still works and the `audit` column is shown as `?`.
 
 Filtering follows npm-style omit/include semantics:
 

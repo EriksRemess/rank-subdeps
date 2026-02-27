@@ -127,44 +127,73 @@ function runNpmOutdated(root, args, execRunner = execFileSync) {
   }
 }
 
-function parseLastUpdatedValue(packageName, raw) {
-  if (typeof raw === 'string') return raw;
-  if (!raw || typeof raw !== 'object') return null;
+function runNpmAudit(root, args, execRunner = execFileSync) {
+  const bin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const npmArgs = ['audit', '--all', '--json'];
+  const omitted = Array.from(args.omit).sort();
+  const included = Array.from(args.include).sort();
+  for (const t of omitted) npmArgs.push(`--omit=${t}`);
+  for (const t of included) npmArgs.push(`--include=${t}`);
 
-  const latestVersion =
+  try {
+    const out = execRunner(bin, npmArgs, {
+      cwd: root,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const text = String(out || '').trim();
+    return text ? JSON.parse(text) : {};
+  } catch (err) {
+    const stdout = String(err?.stdout || '').trim();
+    if (stdout) {
+      try {
+        return JSON.parse(stdout);
+      } catch {}
+    }
+
+    // `npm audit` may fail for registry/auth/network reasons; keep the main
+    // report usable and mark audit counts as unavailable.
+    return null;
+  }
+}
+
+function parsePackageMetaValue(packageName, raw) {
+  if (typeof raw === 'string') return { latest: null, lastUpdated: raw };
+  if (!raw || typeof raw !== 'object') return { latest: null, lastUpdated: null };
+
+  const latest =
     typeof raw['dist-tags.latest'] === 'string'
       ? raw['dist-tags.latest']
       : typeof raw['dist-tags']?.latest === 'string'
         ? raw['dist-tags'].latest
         : null;
-  if (latestVersion && raw.time && typeof raw.time === 'object' && typeof raw.time[latestVersion] === 'string') {
-    return raw.time[latestVersion];
-  }
 
-  if (typeof raw[packageName] === 'string') return raw[packageName];
-  if (typeof raw.modified === 'string') return raw.modified;
-  if (raw.time && typeof raw.time.modified === 'string') return raw.time.modified;
+  if (latest && raw.time && typeof raw.time === 'object' && typeof raw.time[latest] === 'string') {
+    return { latest, lastUpdated: raw.time[latest] };
+  }
+  if (typeof raw[packageName] === 'string') return { latest, lastUpdated: raw[packageName] };
+  if (typeof raw.modified === 'string') return { latest, lastUpdated: raw.modified };
+  if (raw.time && typeof raw.time.modified === 'string') return { latest, lastUpdated: raw.time.modified };
   if (
     raw[packageName] &&
     typeof raw[packageName] === 'object' &&
     typeof raw[packageName].modified === 'string'
   ) {
-    return raw[packageName].modified;
+    return { latest, lastUpdated: raw[packageName].modified };
   }
-  return null;
+  return { latest, lastUpdated: null };
 }
 
-function runNpmViewLastUpdated(root, packageName, execRunner = execFileSync) {
+function runNpmViewPackageMeta(root, packageName, execRunner = execFileSync) {
   const bin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
   const npmArgs = ['view', packageName, 'dist-tags.latest', 'time', '--json'];
 
   const parseOutput = text => {
-    if (!text) return null;
+    if (!text) return { latest: null, lastUpdated: null };
     try {
       const parsed = JSON.parse(text);
-      return parseLastUpdatedValue(packageName, parsed);
+      return parsePackageMetaValue(packageName, parsed);
     } catch {
-      return null;
+      return { latest: null, lastUpdated: null };
     }
   };
 
@@ -179,10 +208,23 @@ function runNpmViewLastUpdated(root, packageName, execRunner = execFileSync) {
   }
 }
 
-function collectLastUpdatedByPackage(root, packageNames, execRunner = execFileSync) {
+function runNpmViewLastUpdated(root, packageName, execRunner = execFileSync) {
+  return runNpmViewPackageMeta(root, packageName, execRunner).lastUpdated;
+}
+
+function collectPackageMetaByPackage(root, packageNames, execRunner = execFileSync) {
   const byPackage = new Map();
   for (const packageName of packageNames) {
-    byPackage.set(packageName, runNpmViewLastUpdated(root, packageName, execRunner));
+    byPackage.set(packageName, runNpmViewPackageMeta(root, packageName, execRunner));
+  }
+  return byPackage;
+}
+
+function collectLastUpdatedByPackage(root, packageNames, execRunner = execFileSync) {
+  const byPackage = new Map();
+  const packageMetaByPackage = collectPackageMetaByPackage(root, packageNames, execRunner);
+  for (const [packageName, packageMeta] of packageMetaByPackage.entries()) {
+    byPackage.set(packageName, packageMeta.lastUpdated ?? null);
   }
   return byPackage;
 }
@@ -241,13 +283,34 @@ function getApproxPathSize(path, pathSizeCache) {
   return total;
 }
 
-function collectSubtreeStats(name, node, pathSizeCache, outdatedMarkers = null) {
+const AUDIT_SEVERITY_RANKS = new Map([
+  ['low', 0],
+  ['moderate', 1],
+  ['high', 2],
+  ['critical', 3],
+]);
+const AUDIT_RANK_TO_SEVERITY = ['low', 'moderate', 'high', 'critical'];
+
+function toAuditSeverityRank(severity) {
+  if (typeof severity !== 'string') return -1;
+  const normalized = severity.toLowerCase();
+  const rank = AUDIT_SEVERITY_RANKS.get(normalized);
+  return rank === undefined ? -1 : rank;
+}
+
+function fromAuditSeverityRank(rank) {
+  return rank >= 0 && rank < AUDIT_RANK_TO_SEVERITY.length ? AUDIT_RANK_TO_SEVERITY[rank] : null;
+}
+
+function collectSubtreeStats(name, node, pathSizeCache, outdatedMarkers = null, auditMarkers = null) {
   // Collect unique (name@version) for this dependency subtree.
   // `subdeps` excludes the top-level dependency itself.
-  if (!node) return { subdeps: 0, outdatedSubdeps: 0, approxBytes: 0 };
+  if (!node) return { subdeps: 0, outdatedSubdeps: 0, auditSubdeps: 0, auditSeverity: null, approxBytes: 0 };
 
   const seen = new Set();
   let outdatedSubdeps = 0;
+  let auditSubdeps = 0;
+  let auditSeverityRank = -1;
   let approxBytes = 0;
   const stack = [[name, node, 0]];
 
@@ -257,7 +320,14 @@ function collectSubtreeStats(name, node, pathSizeCache, outdatedMarkers = null) 
     if (seen.has(id)) continue;
     seen.add(id);
     approxBytes += getApproxPathSize(cur?.path, pathSizeCache);
-    if (depth > 0 && isOutdatedNode(curName, cur, outdatedMarkers)) outdatedSubdeps++;
+    if (depth > 0) {
+      if (isOutdatedNode(curName, cur, outdatedMarkers)) outdatedSubdeps++;
+      const severityRank = getAuditSeverityRankForNode(curName, cur, auditMarkers);
+      if (severityRank >= 0) {
+        auditSubdeps++;
+        if (severityRank > auditSeverityRank) auditSeverityRank = severityRank;
+      }
+    }
 
     if (cur && cur.dependencies) {
       for (const [n2, c2] of Object.entries(cur.dependencies)) {
@@ -266,7 +336,13 @@ function collectSubtreeStats(name, node, pathSizeCache, outdatedMarkers = null) 
     }
   }
 
-  return { subdeps: Math.max(0, seen.size - 1), outdatedSubdeps, approxBytes };
+  return {
+    subdeps: Math.max(0, seen.size - 1),
+    outdatedSubdeps,
+    auditSubdeps,
+    auditSeverity: fromAuditSeverityRank(auditSeverityRank),
+    approxBytes,
+  };
 }
 
 function collectOutdatedMarkers(root, outdatedJson) {
@@ -307,6 +383,58 @@ function isOutdatedNode(name, node, outdatedMarkers) {
   if (!outdatedMarkers) return false;
   if (node?.path && outdatedMarkers.paths.has(resolve(node.path))) return true;
   return outdatedMarkers.ids.has(makeId(name, node?.version));
+}
+
+function collectAuditMarkers(root, auditJson) {
+  const pathSeverityRanks = new Map();
+  const packageSeverityRanks = new Map();
+  if (!auditJson || typeof auditJson !== 'object') return { pathSeverityRanks, packageSeverityRanks };
+
+  const addPath = (path, severityRank) => {
+    if (!path || severityRank < 0) return;
+    const abs = resolve(root, path);
+    const prev = pathSeverityRanks.get(abs);
+    if (prev === undefined || severityRank > prev) pathSeverityRanks.set(abs, severityRank);
+  };
+  const addPackage = (name, severityRank) => {
+    if (typeof name !== 'string' || !name || severityRank < 0) return;
+    const prev = packageSeverityRanks.get(name);
+    if (prev === undefined || severityRank > prev) packageSeverityRanks.set(name, severityRank);
+  };
+
+  if (auditJson.vulnerabilities && typeof auditJson.vulnerabilities === 'object') {
+    for (const [key, value] of Object.entries(auditJson.vulnerabilities)) {
+      if (!value || typeof value !== 'object') continue;
+      const name = typeof value.name === 'string' ? value.name : key;
+      const severityRank = toAuditSeverityRank(value.severity);
+      addPackage(name, severityRank);
+      if (Array.isArray(value.nodes)) {
+        for (const nodePath of value.nodes) {
+          if (typeof nodePath === 'string' && nodePath) addPath(nodePath, severityRank);
+        }
+      }
+    }
+  }
+
+  if (auditJson.advisories && typeof auditJson.advisories === 'object') {
+    for (const advisory of Object.values(auditJson.advisories)) {
+      if (!advisory || typeof advisory !== 'object') continue;
+      const severityRank = toAuditSeverityRank(advisory.severity);
+      addPackage(advisory.module_name, severityRank);
+    }
+  }
+
+  return { pathSeverityRanks, packageSeverityRanks };
+}
+
+function getAuditSeverityRankForNode(name, node, auditMarkers) {
+  if (!auditMarkers) return -1;
+  if (node?.path) {
+    const byPath = auditMarkers.pathSeverityRanks.get(resolve(node.path));
+    if (byPath !== undefined) return byPath;
+  }
+  const byPackage = auditMarkers.packageSeverityRanks.get(name);
+  return byPackage === undefined ? -1 : byPackage;
 }
 
 function collectAggregateApproxBytes(tree, topDepNames, pathSizeCache) {
@@ -477,7 +605,7 @@ Usage:
   rank-subdeps [--json] [--top N] [--sort subdeps|size|name|publish] [--direction asc|desc] [--omit=<type>[,<type>]] [--include=<type>[,<type>]]
 
 Options:
-  --json        Output machine-readable JSON instead of a table (includes lastUpdated and aggregateApproxBytes)
+  --json        Output machine-readable JSON instead of a table (includes latest, lastUpdated, auditSubdeps, and aggregateApproxBytes)
   --top N       Number of items to include in the "Top N" summary (default: 10)
   --sort        Sort by subdeps, size, name, or publish date
   --direction   Sort direction for selected --sort: asc or desc
@@ -534,8 +662,11 @@ function main(argv = process.argv) {
   const pkg = loadPkgJson(root);
   const tree = runNpmLs(root, args);
   const outdatedJson = runNpmOutdated(root, args);
+  const auditJson = runNpmAudit(root, args);
   const outdatedMarkers = collectOutdatedMarkers(root, outdatedJson);
+  const auditMarkers = collectAuditMarkers(root, auditJson);
   const outdatedCountsAvailable = outdatedJson !== null;
+  const auditCountsAvailable = auditJson !== null;
 
   const topDepsMap = new Map();
   const addTopDeps = (depsObj, type) => {
@@ -571,7 +702,7 @@ function main(argv = process.argv) {
       'UNKNOWN';
     topDeps[name] = { ...meta, wanted };
   }
-  const lastUpdatedByPackage = collectLastUpdatedByPackage(root, Object.keys(topDeps));
+  const packageMetaByPackage = collectPackageMetaByPackage(root, Object.keys(topDeps));
 
   const results = [];
   const pathSizeCache = new Map();
@@ -579,29 +710,36 @@ function main(argv = process.argv) {
   for (const [name, meta] of Object.entries(topDeps)) {
     const types = ['prod', 'dev', 'optional', 'peer'].filter(t => meta.types.has(t));
     const node = tree.dependencies?.[name];
+    const packageMeta = packageMetaByPackage.get(name) ?? { latest: null, lastUpdated: null };
     if (!node) {
       results.push({
         name,
         wanted: meta.wanted,
+        latest: packageMeta.latest,
         installed: 'NOT INSTALLED',
-        lastUpdated: lastUpdatedByPackage.get(name) ?? null,
+        lastUpdated: packageMeta.lastUpdated ?? null,
         types,
         subdeps: 0,
         outdatedSubdeps: outdatedCountsAvailable ? 0 : null,
+        auditSubdeps: auditCountsAvailable ? 0 : null,
+        auditSeverity: null,
         approxBytes: 0,
       });
       continue;
     }
 
-    const stats = collectSubtreeStats(name, node, pathSizeCache, outdatedMarkers);
+    const stats = collectSubtreeStats(name, node, pathSizeCache, outdatedMarkers, auditMarkers);
     results.push({
       name,
       wanted: meta.wanted,
+      latest: packageMeta.latest,
       installed: node.version || 'UNKNOWN',
-      lastUpdated: lastUpdatedByPackage.get(name) ?? null,
+      lastUpdated: packageMeta.lastUpdated ?? null,
       types,
       subdeps: stats.subdeps,
       outdatedSubdeps: outdatedCountsAvailable ? stats.outdatedSubdeps : null,
+      auditSubdeps: auditCountsAvailable ? stats.auditSubdeps : null,
+      auditSeverity: auditCountsAvailable ? stats.auditSeverity : null,
       approxBytes: stats.approxBytes,
     });
   }
@@ -619,12 +757,14 @@ function main(argv = process.argv) {
   const header = [
     '#',
     'name',
-    'wanted(range)',
+    'wanted',
+    'latest',
     'installed',
     'last published',
     'types',
     'subdeps',
     'outdated',
+    'audit',
     'approx size',
   ];
   const rows = [header];
@@ -634,11 +774,17 @@ function main(argv = process.argv) {
       String(idx + 1),
       r.name,
       r.wanted,
+      r.latest ?? '?',
       r.installed,
       formatLastUpdated(r.lastUpdated),
       r.types.join(','),
       String(r.subdeps),
       r.outdatedSubdeps == null ? '?' : String(r.outdatedSubdeps),
+      r.auditSubdeps == null
+        ? '?'
+        : r.auditSubdeps === 0
+          ? '0'
+          : `${r.auditSubdeps} (${r.auditSeverity || 'unknown'})`,
       formatApproxBytes(r.approxBytes),
     ]);
   });
@@ -646,11 +792,32 @@ function main(argv = process.argv) {
   const widths = rows[0].map((_, i) => Math.max(...rows.map(row => String(row[i]).length)));
   const line = row => row.map((cell, i) => pad(cell, widths[i])).join('  ');
 
+  const colorEnabled = !!process.stdout.isTTY && !process.env.NO_COLOR;
+  const colorBySeverity = {
+    low: '\x1b[36m',
+    moderate: '\x1b[33m',
+    high: '\x1b[31m',
+    critical: '\x1b[35m',
+  };
+  const colorize = (text, severity) => {
+    if (!colorEnabled || !severity) return text;
+    const color = colorBySeverity[severity];
+    if (!color) return text;
+    return `${color}${text}\x1b[0m`;
+  };
+
   console.log(line(rows[0]));
   console.log(widths.map(w => '-'.repeat(w)).join('  '));
-  for (let i = 1; i < rows.length; i++) console.log(line(rows[i]));
+  for (let i = 1; i < rows.length; i++) {
+    const rowText = line(rows[i]);
+    const severity = results[i - 1]?.auditSeverity;
+    console.log(colorize(rowText, severity));
+  }
   if (!outdatedCountsAvailable) {
     console.log('\nNote: outdated counts unavailable (npm outdated failed).');
+  }
+  if (!auditCountsAvailable) {
+    console.log('\nNote: audit counts unavailable (npm audit failed).');
   }
 
   const topN = results.slice(0, args.top);
@@ -688,7 +855,9 @@ const thisFile = fileURLToPath(import.meta.url);
 if (shouldRunAsCli(thisFile, process.argv[1])) main();
 
 export {
+  collectAuditMarkers,
   collectLastUpdatedByPackage,
+  collectPackageMetaByPackage,
   collectAggregateApproxBytes,
   collectOutdatedMarkers,
   collectSubtreeStats,
@@ -700,7 +869,9 @@ export {
   main,
   parseArgs,
   runNpmLs,
+  runNpmAudit,
   runNpmOutdated,
+  runNpmViewPackageMeta,
   runNpmViewLastUpdated,
   shouldRunAsCli,
 };

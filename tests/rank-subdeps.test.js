@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  collectAuditMarkers,
   collectLastUpdatedByPackage,
+  collectPackageMetaByPackage,
   collectAggregateApproxBytes,
   collectOutdatedMarkers,
   collectSubtreeStats,
@@ -13,7 +15,9 @@ import {
   getResultsComparator,
   parseArgs,
   runNpmLs,
+  runNpmAudit,
   runNpmOutdated,
+  runNpmViewPackageMeta,
   runNpmViewLastUpdated,
   shouldRunAsCli,
 } from '../bin/rank-subdeps.js';
@@ -90,17 +94,47 @@ test('collects subtree and aggregate bytes with dedupe by name@version', () => {
     paths: new Set([join(root, 'node_modules', 'shared')]),
     ids: new Set(),
   };
-  const betaStats = collectSubtreeStats('beta', tree.dependencies.beta, cache, outdatedMarkers);
-  const gammaStats = collectSubtreeStats('gamma', tree.dependencies.gamma, cache, outdatedMarkers);
+  const auditMarkers = {
+    pathSeverityRanks: new Map([[join(root, 'node_modules', 'shared'), 2]]),
+    packageSeverityRanks: new Map(),
+  };
+  const betaStats = collectSubtreeStats('beta', tree.dependencies.beta, cache, outdatedMarkers, auditMarkers);
+  const gammaStats = collectSubtreeStats('gamma', tree.dependencies.gamma, cache, outdatedMarkers, auditMarkers);
   const aggregate = collectAggregateApproxBytes(tree, ['alpha', 'beta', 'gamma'], cache);
 
   assert.equal(betaStats.subdeps, 1);
   assert.equal(gammaStats.subdeps, 1);
   assert.equal(betaStats.outdatedSubdeps, 1);
   assert.equal(gammaStats.outdatedSubdeps, 1);
+  assert.equal(betaStats.auditSubdeps, 1);
+  assert.equal(gammaStats.auditSubdeps, 1);
+  assert.equal(betaStats.auditSeverity, 'high');
+  assert.equal(gammaStats.auditSeverity, 'high');
   assert.equal(betaStats.approxBytes, 60);
   assert.equal(gammaStats.approxBytes, 70);
   assert.equal(aggregate, 100);
+});
+
+test('collectAuditMarkers parses vulnerabilities with severity and node paths', () => {
+  const root = '/tmp/project';
+  const parsed = collectAuditMarkers(root, {
+    vulnerabilities: {
+      'ansi-regex': {
+        name: 'ansi-regex',
+        severity: 'high',
+        nodes: ['node_modules/chalk/node_modules/ansi-regex'],
+      },
+      chalk: {
+        severity: 'moderate',
+        nodes: ['node_modules/chalk'],
+      },
+    },
+  });
+
+  assert.equal(parsed.packageSeverityRanks.get('ansi-regex'), 2);
+  assert.equal(parsed.packageSeverityRanks.get('chalk'), 1);
+  assert.equal(parsed.pathSeverityRanks.get(join(root, 'node_modules', 'chalk')), 1);
+  assert.equal(parsed.pathSeverityRanks.get(join(root, 'node_modules', 'chalk', 'node_modules', 'ansi-regex')), 2);
 });
 
 test('collectOutdatedMarkers parses npm outdated JSON entries recursively', () => {
@@ -163,6 +197,57 @@ test('runNpmOutdated parses JSON from non-zero exit with stdout', () => {
   assert.equal(outdated.chalk.current, '5.3.0');
 });
 
+test('runNpmAudit parses JSON from non-zero exit with stdout', () => {
+  const root = mkdtempSync(join(tmpdir(), 'rank-subdeps-audit-test-'));
+  const args = {
+    omit: new Set(['optional', 'dev']),
+    include: new Set(['peer']),
+  };
+
+  let seenBin = null;
+  let seenArgs = null;
+  const fakeExec = (bin, npmArgs) => {
+    seenBin = bin;
+    seenArgs = npmArgs;
+    const err = new Error('audit found issues');
+    err.stdout = Buffer.from(JSON.stringify({
+      vulnerabilities: {
+        chalk: {
+          severity: 'moderate',
+          nodes: ['node_modules/chalk'],
+        },
+      },
+    }));
+    throw err;
+  };
+
+  const audit = runNpmAudit(root, args, fakeExec);
+
+  assert.ok(seenBin === 'npm' || seenBin === 'npm.cmd');
+  assert.deepEqual(
+    seenArgs,
+    ['audit', '--all', '--json', '--omit=dev', '--omit=optional', '--include=peer']
+  );
+  assert.equal(audit.vulnerabilities.chalk.severity, 'moderate');
+});
+
+test('runNpmViewPackageMeta parses latest dist-tag and latest publish time', () => {
+  const root = mkdtempSync(join(tmpdir(), 'rank-subdeps-view-meta-test-'));
+  const fakeExec = () =>
+    Buffer.from(JSON.stringify({
+      'dist-tags.latest': '5.6.2',
+      time: {
+        modified: '2025-10-29T23:18:03.554Z',
+        '5.6.2': '2025-09-08T14:47:54.486Z',
+      },
+    }));
+
+  const meta = runNpmViewPackageMeta(root, 'chalk', fakeExec);
+
+  assert.equal(meta.latest, '5.6.2');
+  assert.equal(meta.lastUpdated, '2025-09-08T14:47:54.486Z');
+});
+
 test('runNpmViewLastUpdated parses latest dist-tag publish time from npm view', () => {
   const root = mkdtempSync(join(tmpdir(), 'rank-subdeps-view-test-'));
 
@@ -206,6 +291,28 @@ test('collectLastUpdatedByPackage handles mixed success and failure', () => {
 
   assert.equal(results.get('chalk'), '2025-09-08T14:47:54.486Z');
   assert.equal(results.get('missing'), null);
+});
+
+test('collectPackageMetaByPackage handles mixed success and failure', () => {
+  const root = mkdtempSync(join(tmpdir(), 'rank-subdeps-view-meta-map-test-'));
+  const fakeExec = (_bin, npmArgs) => {
+    if (npmArgs[1] === 'chalk') {
+      return Buffer.from(JSON.stringify({
+        'dist-tags.latest': '5.6.2',
+        time: {
+          '5.6.2': '2025-09-08T14:47:54.486Z',
+        },
+      }));
+    }
+    throw new Error('not found');
+  };
+
+  const results = collectPackageMetaByPackage(root, ['chalk', 'missing'], fakeExec);
+
+  assert.equal(results.get('chalk').latest, '5.6.2');
+  assert.equal(results.get('chalk').lastUpdated, '2025-09-08T14:47:54.486Z');
+  assert.equal(results.get('missing').latest, null);
+  assert.equal(results.get('missing').lastUpdated, null);
 });
 
 test('formatLastUpdated uses YYYY-MM-DD and fallback markers', () => {
