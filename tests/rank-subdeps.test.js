@@ -163,7 +163,7 @@ test('runNpmOutdated parses JSON from non-zero exit with stdout', () => {
   assert.equal(outdated.chalk.current, '5.3.0');
 });
 
-test('runNpmViewLastUpdated parses npm view time.modified output', () => {
+test('runNpmViewLastUpdated parses latest dist-tag publish time from npm view', () => {
   const root = mkdtempSync(join(tmpdir(), 'rank-subdeps-view-test-'));
 
   let seenBin = null;
@@ -171,26 +171,40 @@ test('runNpmViewLastUpdated parses npm view time.modified output', () => {
   const fakeExec = (bin, npmArgs) => {
     seenBin = bin;
     seenArgs = npmArgs;
-    return Buffer.from('"2025-10-29T23:18:03.554Z"');
+    return Buffer.from(JSON.stringify({
+      'dist-tags.latest': '5.6.2',
+      time: {
+        created: '2013-08-03T00:21:56.318Z',
+        modified: '2025-10-29T23:18:03.554Z',
+        '5.6.2': '2025-09-08T14:47:54.486Z',
+      },
+    }));
   };
 
   const lastUpdated = runNpmViewLastUpdated(root, 'chalk', fakeExec);
 
   assert.ok(seenBin === 'npm' || seenBin === 'npm.cmd');
-  assert.deepEqual(seenArgs, ['view', 'chalk', 'time.modified', '--json']);
-  assert.equal(lastUpdated, '2025-10-29T23:18:03.554Z');
+  assert.deepEqual(seenArgs, ['view', 'chalk', 'dist-tags.latest', 'time', '--json']);
+  assert.equal(lastUpdated, '2025-09-08T14:47:54.486Z');
 });
 
 test('collectLastUpdatedByPackage handles mixed success and failure', () => {
   const root = mkdtempSync(join(tmpdir(), 'rank-subdeps-view-map-test-'));
   const fakeExec = (_bin, npmArgs) => {
-    if (npmArgs[1] === 'chalk') return Buffer.from('"2025-10-29T23:18:03.554Z"');
+    if (npmArgs[1] === 'chalk') {
+      return Buffer.from(JSON.stringify({
+        'dist-tags.latest': '5.6.2',
+        time: {
+          '5.6.2': '2025-09-08T14:47:54.486Z',
+        },
+      }));
+    }
     throw new Error('not found');
   };
 
   const results = collectLastUpdatedByPackage(root, ['chalk', 'missing'], fakeExec);
 
-  assert.equal(results.get('chalk'), '2025-10-29T23:18:03.554Z');
+  assert.equal(results.get('chalk'), '2025-09-08T14:47:54.486Z');
   assert.equal(results.get('missing'), null);
 });
 

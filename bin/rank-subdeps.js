@@ -130,6 +130,17 @@ function runNpmOutdated(root, args, execRunner = execFileSync) {
 function parseLastUpdatedValue(packageName, raw) {
   if (typeof raw === 'string') return raw;
   if (!raw || typeof raw !== 'object') return null;
+
+  const latestVersion =
+    typeof raw['dist-tags.latest'] === 'string'
+      ? raw['dist-tags.latest']
+      : typeof raw['dist-tags']?.latest === 'string'
+        ? raw['dist-tags'].latest
+        : null;
+  if (latestVersion && raw.time && typeof raw.time === 'object' && typeof raw.time[latestVersion] === 'string') {
+    return raw.time[latestVersion];
+  }
+
   if (typeof raw[packageName] === 'string') return raw[packageName];
   if (typeof raw.modified === 'string') return raw.modified;
   if (raw.time && typeof raw.time.modified === 'string') return raw.time.modified;
@@ -145,7 +156,7 @@ function parseLastUpdatedValue(packageName, raw) {
 
 function runNpmViewLastUpdated(root, packageName, execRunner = execFileSync) {
   const bin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-  const npmArgs = ['view', packageName, 'time.modified', '--json'];
+  const npmArgs = ['view', packageName, 'dist-tags.latest', 'time', '--json'];
 
   const parseOutput = text => {
     if (!text) return null;
@@ -428,7 +439,7 @@ function parseArgs(argv) {
 function printHelpAndExit(code = 0) {
   console.log(`rank-subdeps
 
-Rank top-level dependencies by unique transitive subdependencies, last update date, and approximate file size.
+Rank top-level dependencies by unique transitive subdependencies, latest publish date, and approximate file size.
 
 Usage:
   rank-subdeps [--json] [--top N] [--sort subdeps|size|name] [--omit=<type>[,<type>]] [--include=<type>[,<type>]]
@@ -556,7 +567,7 @@ function main(argv = process.argv) {
     'name',
     'wanted(range)',
     'installed',
-    'last updated',
+    'last published',
     'types',
     'subdeps',
     'outdated',
