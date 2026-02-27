@@ -5,13 +5,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  collectLastUpdatedByPackage,
   collectAggregateApproxBytes,
   collectOutdatedMarkers,
   collectSubtreeStats,
+  formatLastUpdated,
   getResultsComparator,
   parseArgs,
   runNpmLs,
   runNpmOutdated,
+  runNpmViewLastUpdated,
   shouldRunAsCli,
 } from '../bin/rank-subdeps.js';
 
@@ -158,6 +161,43 @@ test('runNpmOutdated parses JSON from non-zero exit with stdout', () => {
     ['outdated', '--all', '--json', '--omit=dev', '--omit=optional', '--include=peer']
   );
   assert.equal(outdated.chalk.current, '5.3.0');
+});
+
+test('runNpmViewLastUpdated parses npm view time.modified output', () => {
+  const root = mkdtempSync(join(tmpdir(), 'rank-subdeps-view-test-'));
+
+  let seenBin = null;
+  let seenArgs = null;
+  const fakeExec = (bin, npmArgs) => {
+    seenBin = bin;
+    seenArgs = npmArgs;
+    return Buffer.from('"2025-10-29T23:18:03.554Z"');
+  };
+
+  const lastUpdated = runNpmViewLastUpdated(root, 'chalk', fakeExec);
+
+  assert.ok(seenBin === 'npm' || seenBin === 'npm.cmd');
+  assert.deepEqual(seenArgs, ['view', 'chalk', 'time.modified', '--json']);
+  assert.equal(lastUpdated, '2025-10-29T23:18:03.554Z');
+});
+
+test('collectLastUpdatedByPackage handles mixed success and failure', () => {
+  const root = mkdtempSync(join(tmpdir(), 'rank-subdeps-view-map-test-'));
+  const fakeExec = (_bin, npmArgs) => {
+    if (npmArgs[1] === 'chalk') return Buffer.from('"2025-10-29T23:18:03.554Z"');
+    throw new Error('not found');
+  };
+
+  const results = collectLastUpdatedByPackage(root, ['chalk', 'missing'], fakeExec);
+
+  assert.equal(results.get('chalk'), '2025-10-29T23:18:03.554Z');
+  assert.equal(results.get('missing'), null);
+});
+
+test('formatLastUpdated uses YYYY-MM-DD and fallback markers', () => {
+  assert.equal(formatLastUpdated('2025-10-29T23:18:03.554Z'), '2025-10-29');
+  assert.equal(formatLastUpdated('not-a-date'), 'not-a-date');
+  assert.equal(formatLastUpdated(null), '?');
 });
 
 test('parseArgs supports --sort value and --sort=value', () => {

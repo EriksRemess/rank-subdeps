@@ -127,6 +127,55 @@ function runNpmOutdated(root, args, execRunner = execFileSync) {
   }
 }
 
+function parseLastUpdatedValue(packageName, raw) {
+  if (typeof raw === 'string') return raw;
+  if (!raw || typeof raw !== 'object') return null;
+  if (typeof raw[packageName] === 'string') return raw[packageName];
+  if (typeof raw.modified === 'string') return raw.modified;
+  if (raw.time && typeof raw.time.modified === 'string') return raw.time.modified;
+  if (
+    raw[packageName] &&
+    typeof raw[packageName] === 'object' &&
+    typeof raw[packageName].modified === 'string'
+  ) {
+    return raw[packageName].modified;
+  }
+  return null;
+}
+
+function runNpmViewLastUpdated(root, packageName, execRunner = execFileSync) {
+  const bin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const npmArgs = ['view', packageName, 'time.modified', '--json'];
+
+  const parseOutput = text => {
+    if (!text) return null;
+    try {
+      const parsed = JSON.parse(text);
+      return parseLastUpdatedValue(packageName, parsed);
+    } catch {
+      return null;
+    }
+  };
+
+  try {
+    const out = execRunner(bin, npmArgs, {
+      cwd: root,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return parseOutput(String(out || '').trim());
+  } catch (err) {
+    return parseOutput(String(err?.stdout || '').trim());
+  }
+}
+
+function collectLastUpdatedByPackage(root, packageNames, execRunner = execFileSync) {
+  const byPackage = new Map();
+  for (const packageName of packageNames) {
+    byPackage.set(packageName, runNpmViewLastUpdated(root, packageName, execRunner));
+  }
+  return byPackage;
+}
+
 const makeId = (name, version) => `${name}@${version || 'UNKNOWN'}`;
 
 function getApproxPathSize(path, pathSizeCache) {
@@ -291,6 +340,13 @@ function formatApproxBytes(bytes) {
   return `~${text} ${units[unitIdx]}`;
 }
 
+function formatLastUpdated(value) {
+  if (typeof value !== 'string' || !value) return '?';
+  const date = new Date(value);
+  if (!Number.isFinite(date.valueOf())) return value;
+  return date.toISOString().slice(0, 10);
+}
+
 const pad = (str, len) => {
   str = String(str);
   return str.length >= len ? str : str + ' '.repeat(len - str.length);
@@ -372,13 +428,13 @@ function parseArgs(argv) {
 function printHelpAndExit(code = 0) {
   console.log(`rank-subdeps
 
-Rank top-level dependencies by unique transitive subdependencies and approximate file size.
+Rank top-level dependencies by unique transitive subdependencies, last update date, and approximate file size.
 
 Usage:
   rank-subdeps [--json] [--top N] [--sort subdeps|size|name] [--omit=<type>[,<type>]] [--include=<type>[,<type>]]
 
 Options:
-  --json        Output machine-readable JSON instead of a table (includes aggregateApproxBytes)
+  --json        Output machine-readable JSON instead of a table (includes lastUpdated and aggregateApproxBytes)
   --top N       Number of items to include in the "Top N" summary (default: 10)
   --sort        Sort by subdependency count (subdeps), approx size (size), or package name (name)
   --omit        Dependency types to omit: dev, optional, peer (can be repeated)
@@ -450,6 +506,7 @@ function main(argv = process.argv) {
       'UNKNOWN';
     topDeps[name] = { ...meta, wanted };
   }
+  const lastUpdatedByPackage = collectLastUpdatedByPackage(root, Object.keys(topDeps));
 
   const results = [];
   const pathSizeCache = new Map();
@@ -462,6 +519,7 @@ function main(argv = process.argv) {
         name,
         wanted: meta.wanted,
         installed: 'NOT INSTALLED',
+        lastUpdated: lastUpdatedByPackage.get(name) ?? null,
         types,
         subdeps: 0,
         outdatedSubdeps: outdatedCountsAvailable ? 0 : null,
@@ -475,6 +533,7 @@ function main(argv = process.argv) {
       name,
       wanted: meta.wanted,
       installed: node.version || 'UNKNOWN',
+      lastUpdated: lastUpdatedByPackage.get(name) ?? null,
       types,
       subdeps: stats.subdeps,
       outdatedSubdeps: outdatedCountsAvailable ? stats.outdatedSubdeps : null,
@@ -492,7 +551,17 @@ function main(argv = process.argv) {
   }
 
   // Pretty table
-  const header = ['#', 'name', 'wanted(range)', 'installed', 'types', 'subdeps', 'outdated', 'approx size'];
+  const header = [
+    '#',
+    'name',
+    'wanted(range)',
+    'installed',
+    'last updated',
+    'types',
+    'subdeps',
+    'outdated',
+    'approx size',
+  ];
   const rows = [header];
 
   results.forEach((r, idx) => {
@@ -501,6 +570,7 @@ function main(argv = process.argv) {
       r.name,
       r.wanted,
       r.installed,
+      formatLastUpdated(r.lastUpdated),
       r.types.join(','),
       String(r.subdeps),
       r.outdatedSubdeps == null ? '?' : String(r.outdatedSubdeps),
@@ -545,10 +615,12 @@ const thisFile = fileURLToPath(import.meta.url);
 if (shouldRunAsCli(thisFile, process.argv[1])) main();
 
 export {
+  collectLastUpdatedByPackage,
   collectAggregateApproxBytes,
   collectOutdatedMarkers,
   collectSubtreeStats,
   formatApproxBytes,
+  formatLastUpdated,
   getApproxPathSize,
   getResultsComparator,
   isOutdatedNode,
@@ -556,5 +628,6 @@ export {
   parseArgs,
   runNpmLs,
   runNpmOutdated,
+  runNpmViewLastUpdated,
   shouldRunAsCli,
 };
