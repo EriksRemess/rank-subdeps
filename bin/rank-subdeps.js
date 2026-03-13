@@ -27,8 +27,10 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 function readJSON(p) {
   try {
@@ -218,6 +220,206 @@ function collectPackageMetaByPackage(root, packageNames, execRunner = execFileSy
     byPackage.set(packageName, runNpmViewPackageMeta(root, packageName, execRunner));
   }
   return byPackage;
+}
+
+function spawnText(bin, commandArgs, options = {}) {
+  return new Promise((resolve, reject) => {
+    const captureDir = mkdtempSync(join(tmpdir(), 'rank-subdeps-'));
+    const stdoutPath = join(captureDir, 'stdout.txt');
+    let stdoutFd = null;
+    let stdout = '';
+    let stderr = '';
+
+    const finish = (error, code = 0) => {
+      if (stdoutFd !== null) {
+        try {
+          closeSync(stdoutFd);
+        } catch {}
+        stdoutFd = null;
+      }
+      try {
+        stdout = readFileSync(stdoutPath, 'utf8');
+      } catch {}
+      try {
+        rmSync(captureDir, { recursive: true, force: true });
+      } catch {}
+
+      if (!error && code === 0) {
+        resolve({ stdout, stderr });
+        return;
+      }
+
+      const failure = error || new Error(`${bin} ${commandArgs.join(' ')} exited with code ${code}`);
+      failure.code ??= code;
+      failure.stdout = stdout;
+      failure.stderr = stderr;
+      reject(failure);
+    };
+
+    try {
+      stdoutFd = openSync(stdoutPath, 'w');
+    } catch (error) {
+      finish(error, 1);
+      return;
+    }
+
+    const child = spawn(bin, commandArgs, {
+      cwd: options.cwd,
+      stdio: ['ignore', stdoutFd, 'pipe'],
+      windowsHide: true,
+    });
+
+    child.stderr.on('data', chunk => {
+      stderr += chunk;
+    });
+
+    child.on('error', error => {
+      finish(error, 1);
+    });
+    child.on('close', code => {
+      finish(null, code);
+    });
+  });
+}
+
+async function runNpmLsAsync(root, args) {
+  const bin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const npmArgs = ['ls', '--all', '--json', '--long'];
+  const omitted = Array.from(args.omit).sort();
+  const included = Array.from(args.include).sort();
+  for (const t of omitted) npmArgs.push(`--omit=${t}`);
+  for (const t of included) npmArgs.push(`--include=${t}`);
+
+  try {
+    const { stdout } = await spawnText(bin, npmArgs, { cwd: root });
+    return JSON.parse(stdout);
+  } catch (err) {
+    const stdout = String(err?.stdout || '');
+    if (stdout) {
+      try {
+        return JSON.parse(stdout);
+      } catch {}
+    }
+    const failure = new Error('Failed to run "npm ls --all --json".');
+    failure.stderr = String(err?.stderr || '');
+    throw failure;
+  }
+}
+
+async function runNpmOutdatedAsync(root, args) {
+  const bin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const npmArgs = ['outdated', '--all', '--json'];
+  const omitted = Array.from(args.omit).sort();
+  const included = Array.from(args.include).sort();
+  for (const t of omitted) npmArgs.push(`--omit=${t}`);
+  for (const t of included) npmArgs.push(`--include=${t}`);
+
+  try {
+    const { stdout } = await spawnText(bin, npmArgs, { cwd: root });
+    const text = String(stdout || '').trim();
+    return text ? JSON.parse(text) : {};
+  } catch (err) {
+    const stdout = String(err?.stdout || '').trim();
+    if (stdout) {
+      try {
+        return JSON.parse(stdout);
+      } catch {}
+    }
+    return null;
+  }
+}
+
+async function runNpmAuditAsync(root, args) {
+  const bin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const npmArgs = ['audit', '--all', '--json'];
+  const omitted = Array.from(args.omit).sort();
+  const included = Array.from(args.include).sort();
+  for (const t of omitted) npmArgs.push(`--omit=${t}`);
+  for (const t of included) npmArgs.push(`--include=${t}`);
+
+  try {
+    const { stdout } = await spawnText(bin, npmArgs, { cwd: root });
+    const text = String(stdout || '').trim();
+    return text ? JSON.parse(text) : {};
+  } catch (err) {
+    const stdout = String(err?.stdout || '').trim();
+    if (stdout) {
+      try {
+        return JSON.parse(stdout);
+      } catch {}
+    }
+    return null;
+  }
+}
+
+async function runNpmViewPackageMetaAsync(root, packageName) {
+  const bin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const npmArgs = ['view', packageName, 'dist-tags.latest', 'time', '--json'];
+
+  const parseOutput = text => {
+    if (!text) return { latest: null, lastUpdated: null };
+    try {
+      const parsed = JSON.parse(text);
+      return parsePackageMetaValue(packageName, parsed);
+    } catch {
+      return { latest: null, lastUpdated: null };
+    }
+  };
+
+  try {
+    const { stdout } = await spawnText(bin, npmArgs, { cwd: root });
+    return parseOutput(String(stdout || '').trim());
+  } catch (err) {
+    return parseOutput(String(err?.stdout || '').trim());
+  }
+}
+
+async function collectPackageMetaByPackageAsync(root, packageNames, onProgress = null) {
+  const byPackage = new Map();
+  for (let idx = 0; idx < packageNames.length; idx++) {
+    const packageName = packageNames[idx];
+    onProgress?.({ current: idx + 1, total: packageNames.length, packageName });
+    byPackage.set(packageName, await runNpmViewPackageMetaAsync(root, packageName));
+  }
+  return byPackage;
+}
+
+function createProgressReporter({ enabled = false, stream = process.stderr } = {}) {
+  if (!enabled) {
+    return {
+      start() {},
+      update() {},
+      stop() {},
+    };
+  }
+
+  let frameIndex = 0;
+  let message = '';
+  let timer = null;
+
+  const render = () => {
+    const frame = SPINNER_FRAMES[frameIndex];
+    frameIndex = (frameIndex + 1) % SPINNER_FRAMES.length;
+    stream.write(`\r\x1b[2K${frame} ${message}`);
+  };
+
+  return {
+    start(nextMessage) {
+      message = nextMessage;
+      render();
+      timer = setInterval(render, 80);
+      timer.unref?.();
+    },
+    update(nextMessage) {
+      message = nextMessage;
+      render();
+    },
+    stop() {
+      if (timer) clearInterval(timer);
+      timer = null;
+      stream.write('\r\x1b[2K');
+    },
+  };
 }
 
 function collectLastUpdatedByPackage(root, packageNames, execRunner = execFileSync) {
@@ -656,96 +858,122 @@ function getResultsComparator(sortMode, direction = null) {
     a.name.localeCompare(b.name);
 }
 
-function main(argv = process.argv) {
+async function main(argv = process.argv) {
   const args = parseArgs(argv);
   const root = process.cwd();
   const pkg = loadPkgJson(root);
-  const tree = runNpmLs(root, args);
-  const outdatedJson = runNpmOutdated(root, args);
-  const auditJson = runNpmAudit(root, args);
-  const outdatedMarkers = collectOutdatedMarkers(root, outdatedJson);
-  const auditMarkers = collectAuditMarkers(root, auditJson);
-  const outdatedCountsAvailable = outdatedJson !== null;
-  const auditCountsAvailable = auditJson !== null;
+  const progress = createProgressReporter({
+    enabled: !args.json && !!process.stderr.isTTY,
+  });
 
-  const topDepsMap = new Map();
-  const addTopDeps = (depsObj, type) => {
-    if (!depsObj) return;
-    if (type !== 'prod' && args.omit.has(type)) return;
-    for (const [name, wanted] of Object.entries(depsObj)) {
-      const cur = topDepsMap.get(name);
-      if (!cur) {
-        topDepsMap.set(name, {
-          types: new Set([type]),
-          wantedByType: { [type]: wanted },
-        });
-      } else {
-        cur.types.add(type);
-        cur.wantedByType[type] = wanted;
+  progress.start('Inspecting dependency tree');
+
+  let results;
+  let aggregateApproxBytes;
+  let outdatedCountsAvailable;
+  let auditCountsAvailable;
+
+  try {
+    const tree = await runNpmLsAsync(root, args);
+    progress.update('Checking outdated packages');
+    const outdatedJson = await runNpmOutdatedAsync(root, args);
+    progress.update('Checking audit issues');
+    const auditJson = await runNpmAuditAsync(root, args);
+    const outdatedMarkers = collectOutdatedMarkers(root, outdatedJson);
+    const auditMarkers = collectAuditMarkers(root, auditJson);
+    outdatedCountsAvailable = outdatedJson !== null;
+    auditCountsAvailable = auditJson !== null;
+
+    const topDepsMap = new Map();
+    const addTopDeps = (depsObj, type) => {
+      if (!depsObj) return;
+      if (type !== 'prod' && args.omit.has(type)) return;
+      for (const [name, wanted] of Object.entries(depsObj)) {
+        const cur = topDepsMap.get(name);
+        if (!cur) {
+          topDepsMap.set(name, {
+            types: new Set([type]),
+            wantedByType: { [type]: wanted },
+          });
+        } else {
+          cur.types.add(type);
+          cur.wantedByType[type] = wanted;
+        }
       }
+    };
+
+    addTopDeps(pkg.dependencies, 'prod');
+    addTopDeps(pkg.devDependencies, 'dev');
+    addTopDeps(pkg.optionalDependencies, 'optional');
+    addTopDeps(pkg.peerDependencies, 'peer');
+
+    const topDeps = {};
+    for (const [name, meta] of topDepsMap.entries()) {
+      // npm semantics: optionalDependencies override dependencies when both exist.
+      const wanted =
+        meta.wantedByType.optional ??
+        meta.wantedByType.prod ??
+        meta.wantedByType.dev ??
+        meta.wantedByType.peer ??
+        'UNKNOWN';
+      topDeps[name] = { ...meta, wanted };
     }
-  };
 
-  addTopDeps(pkg.dependencies, 'prod');
-  addTopDeps(pkg.devDependencies, 'dev');
-  addTopDeps(pkg.optionalDependencies, 'optional');
-  addTopDeps(pkg.peerDependencies, 'peer');
+    const topDepNames = Object.keys(topDeps);
+    const packageMetaByPackage = await collectPackageMetaByPackageAsync(
+      root,
+      topDepNames,
+      ({ current, total }) => {
+        progress.update(`Fetching package metadata (${current}/${total})`);
+      }
+    );
 
-  const topDeps = {};
-  for (const [name, meta] of topDepsMap.entries()) {
-    // npm semantics: optionalDependencies override dependencies when both exist.
-    const wanted =
-      meta.wantedByType.optional ??
-      meta.wantedByType.prod ??
-      meta.wantedByType.dev ??
-      meta.wantedByType.peer ??
-      'UNKNOWN';
-    topDeps[name] = { ...meta, wanted };
-  }
-  const packageMetaByPackage = collectPackageMetaByPackage(root, Object.keys(topDeps));
+    progress.update('Building results');
+    results = [];
+    const pathSizeCache = new Map();
 
-  const results = [];
-  const pathSizeCache = new Map();
+    for (const [name, meta] of Object.entries(topDeps)) {
+      const types = ['prod', 'dev', 'optional', 'peer'].filter(t => meta.types.has(t));
+      const node = tree.dependencies?.[name];
+      const packageMeta = packageMetaByPackage.get(name) ?? { latest: null, lastUpdated: null };
+      if (!node) {
+        results.push({
+          name,
+          wanted: meta.wanted,
+          latest: packageMeta.latest,
+          installed: 'NOT INSTALLED',
+          lastUpdated: packageMeta.lastUpdated ?? null,
+          types,
+          subdeps: 0,
+          outdatedSubdeps: outdatedCountsAvailable ? 0 : null,
+          auditSubdeps: auditCountsAvailable ? 0 : null,
+          auditSeverity: null,
+          approxBytes: 0,
+        });
+        continue;
+      }
 
-  for (const [name, meta] of Object.entries(topDeps)) {
-    const types = ['prod', 'dev', 'optional', 'peer'].filter(t => meta.types.has(t));
-    const node = tree.dependencies?.[name];
-    const packageMeta = packageMetaByPackage.get(name) ?? { latest: null, lastUpdated: null };
-    if (!node) {
+      const stats = collectSubtreeStats(name, node, pathSizeCache, outdatedMarkers, auditMarkers);
       results.push({
         name,
         wanted: meta.wanted,
         latest: packageMeta.latest,
-        installed: 'NOT INSTALLED',
+        installed: node.version || 'UNKNOWN',
         lastUpdated: packageMeta.lastUpdated ?? null,
         types,
-        subdeps: 0,
-        outdatedSubdeps: outdatedCountsAvailable ? 0 : null,
-        auditSubdeps: auditCountsAvailable ? 0 : null,
-        auditSeverity: null,
-        approxBytes: 0,
+        subdeps: stats.subdeps,
+        outdatedSubdeps: outdatedCountsAvailable ? stats.outdatedSubdeps : null,
+        auditSubdeps: auditCountsAvailable ? stats.auditSubdeps : null,
+        auditSeverity: auditCountsAvailable ? stats.auditSeverity : null,
+        approxBytes: stats.approxBytes,
       });
-      continue;
     }
 
-    const stats = collectSubtreeStats(name, node, pathSizeCache, outdatedMarkers, auditMarkers);
-    results.push({
-      name,
-      wanted: meta.wanted,
-      latest: packageMeta.latest,
-      installed: node.version || 'UNKNOWN',
-      lastUpdated: packageMeta.lastUpdated ?? null,
-      types,
-      subdeps: stats.subdeps,
-      outdatedSubdeps: outdatedCountsAvailable ? stats.outdatedSubdeps : null,
-      auditSubdeps: auditCountsAvailable ? stats.auditSubdeps : null,
-      auditSeverity: auditCountsAvailable ? stats.auditSeverity : null,
-      approxBytes: stats.approxBytes,
-    });
+    results.sort(getResultsComparator(args.sort, args.direction));
+    aggregateApproxBytes = collectAggregateApproxBytes(tree, topDepNames, pathSizeCache);
+  } finally {
+    progress.stop();
   }
-
-  results.sort(getResultsComparator(args.sort, args.direction));
-  const aggregateApproxBytes = collectAggregateApproxBytes(tree, Object.keys(topDeps), pathSizeCache);
 
   if (args.json) {
     // JSON mode: full dataset
@@ -852,7 +1080,13 @@ function shouldRunAsCli(moduleFilePath, argv1) {
 }
 
 const thisFile = fileURLToPath(import.meta.url);
-if (shouldRunAsCli(thisFile, process.argv[1])) main();
+if (shouldRunAsCli(thisFile, process.argv[1])) {
+  main().catch(err => {
+    console.error(err?.message || String(err));
+    if (err?.stderr) console.error(String(err.stderr));
+    process.exit(1);
+  });
+}
 
 export {
   collectAuditMarkers,
