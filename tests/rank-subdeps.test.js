@@ -6,14 +6,29 @@ import { join } from 'node:path';
 
 import {
   collectAuditMarkers,
+  collectGitHubCommitDatesByPackage,
+  collectGitHubPackageInfoByPackage,
   collectLastUpdatedByPackage,
   collectPackageMetaByPackage,
   collectAggregateApproxBytes,
   collectOutdatedMarkers,
   collectSubtreeStats,
+  compareLatestToInstalled,
+  compareSemverVersions,
+  formatInstalledVersion,
+  formatLatestVersion,
+  formatLatestWithStatus,
   formatLastUpdated,
+  getGitHubCommitRefForNode,
+  getGitHubTrackingRefForNode,
   getResultsComparator,
+  parseGitHubCommitMetaValue,
+  parseGitHubCommitRef,
+  parseGitHubCommitDateValue,
   parseArgs,
+  runGitHubCommitDate,
+  runGitHubCommitMeta,
+  runGitHubLatestCommitMeta,
   runNpmLs,
   runNpmAudit,
   runNpmOutdated,
@@ -313,6 +328,416 @@ test('collectPackageMetaByPackage handles mixed success and failure', () => {
   assert.equal(results.get('chalk').lastUpdated, '2025-09-08T14:47:54.486Z');
   assert.equal(results.get('missing').latest, null);
   assert.equal(results.get('missing').lastUpdated, null);
+});
+
+test('parseGitHubCommitRef recognizes common GitHub dependency refs', () => {
+  assert.deepEqual(parseGitHubCommitRef('github:octo/example#abc123'), {
+    owner: 'octo',
+    repo: 'example',
+    ref: 'abc123',
+  });
+  assert.deepEqual(parseGitHubCommitRef('git+ssh://git@github.com:octo/example.git#refs/tags/v1.0.0'), {
+    owner: 'octo',
+    repo: 'example',
+    ref: 'v1.0.0',
+  });
+  assert.deepEqual(parseGitHubCommitRef('https://codeload.github.com/octo/example/tar.gz/deadbeef'), {
+    owner: 'octo',
+    repo: 'example',
+    ref: 'deadbeef',
+  });
+  assert.equal(parseGitHubCommitRef('github:octo/example#semver:^1.0.0'), null);
+  assert.equal(parseGitHubCommitRef('^1.0.0'), null);
+});
+
+test('getGitHubCommitRefForNode uses installed GitHub source plus gitHead', () => {
+  const root = mkdtempSync(join(tmpdir(), 'rank-subdeps-github-source-test-'));
+  const githubPackageDir = join(root, 'node_modules', 'github-dep');
+  mkdirSync(githubPackageDir, { recursive: true });
+  writeFileSync(
+    join(githubPackageDir, 'package.json'),
+    JSON.stringify({
+      name: 'github-dep',
+      version: '1.0.0',
+      _from: 'github:octo/example',
+      gitHead: 'deadbeef',
+    }),
+    'utf8'
+  );
+
+  assert.deepEqual(
+    getGitHubCommitRefForNode('github-dep', { version: '1.0.0', path: githubPackageDir }, '^1.0.0'),
+    {
+      owner: 'octo',
+      repo: 'example',
+      ref: 'deadbeef',
+    }
+  );
+
+  const registryPackageDir = join(root, 'node_modules', 'registry-dep');
+  mkdirSync(registryPackageDir, { recursive: true });
+  writeFileSync(
+    join(registryPackageDir, 'package.json'),
+    JSON.stringify({
+      name: 'registry-dep',
+      version: '1.0.0',
+      repository: {
+        url: 'https://github.com/octo/example.git',
+      },
+      gitHead: 'deadbeef',
+    }),
+    'utf8'
+  );
+
+  assert.equal(
+    getGitHubCommitRefForNode('registry-dep', { version: '1.0.0', path: registryPackageDir }, '^1.0.0'),
+    null
+  );
+});
+
+test('getGitHubCommitRefForNode prefers resolved installed commit over requested branch', () => {
+  assert.deepEqual(
+    getGitHubCommitRefForNode(
+      'express',
+      {
+        version: '1.0.0',
+        from: 'github:EriksRemess/express#eriks-esm',
+      },
+      'github:EriksRemess/express#eriks-esm',
+      {
+        version: '1.0.0',
+        resolved: 'git+https://github.com/EriksRemess/express.git#ee84143abcdef',
+      }
+    ),
+    {
+      owner: 'EriksRemess',
+      repo: 'express',
+      ref: 'ee84143abcdef',
+    }
+  );
+});
+
+test('getGitHubTrackingRefForNode prefers requested GitHub branch over lockfile commit', () => {
+  const node = {
+    version: '1.0.0',
+  };
+  const lockEntry = {
+    version: '1.0.0',
+    resolved: 'git+https://github.com/EriksRemess/express.git#abcdef1234567890',
+    from: 'github:EriksRemess/express#ee84143',
+  };
+
+  assert.deepEqual(
+    getGitHubTrackingRefForNode(
+      'express',
+      node,
+      'github:EriksRemess/express#eriks-esm',
+      lockEntry
+    ),
+    {
+      owner: 'EriksRemess',
+      repo: 'express',
+      ref: 'eriks-esm',
+    }
+  );
+
+  assert.deepEqual(getGitHubTrackingRefForNode('express', node, 'github:EriksRemess/express', lockEntry), {
+    owner: 'EriksRemess',
+    repo: 'express',
+    ref: null,
+  });
+});
+
+test('runGitHubCommitMeta requests GitHub commit API and parses committer date and SHA', async () => {
+  let seenUrl = null;
+  const fakeRequester = async url => {
+    seenUrl = url;
+    return {
+      sha: 'abcdef1234567890',
+      commit: {
+        committer: {
+          date: '2025-11-01T12:34:56Z',
+        },
+      },
+    };
+  };
+  const meta = await runGitHubCommitMeta(
+    { owner: 'octo', repo: 'example', ref: 'feature/test' },
+    fakeRequester
+  );
+  const date = await runGitHubCommitDate({ owner: 'octo', repo: 'example', ref: 'feature/test' }, fakeRequester);
+
+  assert.equal(seenUrl, 'https://api.github.com/repos/octo/example/commits/feature%2Ftest');
+  assert.deepEqual(meta, { date: '2025-11-01T12:34:56Z', sha: 'abcdef1234567890' });
+  assert.equal(date, '2025-11-01T12:34:56Z');
+  assert.equal(parseGitHubCommitDateValue({ commit: { author: { date: '2025-10-01T00:00:00Z' } } }), '2025-10-01T00:00:00Z');
+  assert.deepEqual(parseGitHubCommitMetaValue({ sha: '1234567', commit: { author: { date: '2025-10-01T00:00:00Z' } } }), {
+    date: '2025-10-01T00:00:00Z',
+    sha: '1234567',
+  });
+});
+
+test('runGitHubLatestCommitMeta requests latest GitHub commit list entry', async () => {
+  let seenUrl = null;
+  const meta = await runGitHubLatestCommitMeta(
+    { owner: 'octo', repo: 'example', ref: 'abc123' },
+    async url => {
+      seenUrl = url;
+      return [
+        {
+          sha: '9999999abcdef',
+          commit: {
+            committer: {
+              date: '2025-12-01T00:00:00Z',
+            },
+          },
+        },
+      ];
+    }
+  );
+
+  assert.equal(seenUrl, 'https://api.github.com/repos/octo/example/commits?sha=abc123&per_page=1');
+  assert.deepEqual(meta, { date: '2025-12-01T00:00:00Z', sha: '9999999abcdef' });
+});
+
+test('formatInstalledVersion uses a short hash for GitHub packages', () => {
+  assert.equal(formatInstalledVersion('1.0.0', { sha: 'abcdef1234567890' }), 'abcdef1');
+  assert.equal(formatInstalledVersion('1.0.0', { githubRef: { ref: 'deadbeef' } }), 'deadbee');
+  assert.equal(formatInstalledVersion('1.0.0', { githubRef: { ref: 'main' } }), '1.0.0');
+  assert.equal(formatInstalledVersion(null, null), 'UNKNOWN');
+});
+
+test('formatLatestVersion uses latest commit hash for GitHub packages', () => {
+  assert.equal(formatLatestVersion('5.6.2', { latestSha: '9999999abcdef' }), '9999999');
+  assert.equal(formatLatestVersion('5.6.2', { latestSha: null }), '?');
+  assert.equal(formatLatestVersion('5.6.2', null), '5.6.2');
+});
+
+test('compareSemverVersions orders semver versions', () => {
+  assert.equal(compareSemverVersions('5.6.2', '5.3.0') > 0, true);
+  assert.equal(compareSemverVersions('1.0.0', '1.0.1') < 0, true);
+  assert.equal(compareSemverVersions('1.0.0', '1.0.0-beta.1') > 0, true);
+  assert.equal(compareSemverVersions('1.0.0-beta.2', '1.0.0-beta.10') < 0, true);
+  assert.equal(compareSemverVersions('main', '1.0.0'), null);
+});
+
+test('compareLatestToInstalled classifies registry and GitHub differences', () => {
+  assert.equal(compareLatestToInstalled('5.6.2', '5.3.0'), 'newer');
+  assert.equal(compareLatestToInstalled('5.3.0', '5.6.2'), 'older');
+  assert.equal(compareLatestToInstalled('5.6.2', '5.6.2'), 'same');
+  assert.equal(compareLatestToInstalled('main', 'abcdef1'), 'different');
+  assert.equal(compareLatestToInstalled('?', 'abcdef1'), null);
+  assert.equal(
+    compareLatestToInstalled('9999999', 'abcdef1', {
+      sha: 'abcdef1234567890',
+      latestSha: '9999999abcdef',
+      date: '2025-11-01T00:00:00Z',
+      latestDate: '2025-12-01T00:00:00Z',
+    }),
+    'newer'
+  );
+  assert.equal(
+    compareLatestToInstalled('9999999', 'abcdef1', {
+      sha: 'abcdef1234567890',
+      latestSha: '9999999abcdef',
+      date: '2025-12-01T00:00:00Z',
+      latestDate: '2025-11-01T00:00:00Z',
+    }),
+    'older'
+  );
+  assert.equal(
+    compareLatestToInstalled('9999999', 'abcdef1', {
+      sha: 'abcdef1234567890',
+      latestSha: '9999999abcdef',
+    }),
+    'different'
+  );
+});
+
+test('formatLatestWithStatus highlights changed latest values', () => {
+  assert.equal(formatLatestWithStatus('5.6.2', 'newer'), '5.6.2 (newer)');
+  assert.equal(formatLatestWithStatus('5.6.2', 'older'), '5.6.2 (older)');
+  assert.equal(formatLatestWithStatus('main', 'different'), 'main (different)');
+  assert.equal(formatLatestWithStatus('5.6.2', 'same'), '5.6.2');
+  assert.equal(formatLatestWithStatus('5.6.2', null), '5.6.2');
+});
+
+test('collectGitHubCommitDatesByPackage only fetches dates for GitHub-installed packages', async () => {
+  const topDeps = {
+    githubDep: {
+      wanted: '^1.0.0',
+    },
+    registryDep: {
+      wanted: '^1.0.0',
+    },
+  };
+  const tree = {
+    dependencies: {
+      githubDep: {
+        version: '1.0.0',
+      },
+      registryDep: {
+        version: '1.0.0',
+      },
+    },
+  };
+  const packageLock = {
+    packages: {
+      'node_modules/githubDep': {
+        version: '1.0.0',
+        resolved: 'git+https://github.com/octo/example.git#abc123',
+      },
+      'node_modules/registryDep': {
+        version: '1.0.0',
+        resolved: 'https://registry.npmjs.org/registryDep/-/registryDep-1.0.0.tgz',
+      },
+    },
+  };
+  const seenUrls = [];
+
+  const results = await collectGitHubCommitDatesByPackage(
+    topDeps,
+    tree,
+    async url => {
+      seenUrls.push(url);
+      if (url.endsWith('/commits?per_page=1')) {
+        return [
+          {
+            sha: '9999999abcdef',
+            commit: {
+              committer: {
+                date: '2025-12-01T00:00:00Z',
+              },
+            },
+          },
+        ];
+      }
+      return {
+        sha: 'abcdef1234567890',
+        commit: {
+          committer: {
+            date: '2025-11-01T12:34:56Z',
+          },
+        },
+      };
+    },
+    null,
+    packageLock
+  );
+
+  assert.deepEqual(seenUrls, [
+    'https://api.github.com/repos/octo/example/commits/abc123',
+    'https://api.github.com/repos/octo/example/commits?per_page=1',
+  ]);
+  assert.equal(results.get('githubDep'), '2025-11-01T12:34:56Z');
+  assert.equal(results.has('registryDep'), false);
+});
+
+test('collectGitHubPackageInfoByPackage checks latest commit on requested branch', async () => {
+  const topDeps = {
+    express: {
+      wanted: 'github:EriksRemess/express#eriks-esm',
+    },
+  };
+  const tree = {
+    dependencies: {
+      express: {
+        version: '1.0.0',
+      },
+    },
+  };
+  const packageLock = {
+    packages: {
+      'node_modules/express': {
+        version: '1.0.0',
+        resolved: 'git+https://github.com/EriksRemess/express.git#abcdef1234567890',
+      },
+    },
+  };
+  const seenUrls = [];
+
+  const results = await collectGitHubPackageInfoByPackage(
+    topDeps,
+    tree,
+    async url => {
+      seenUrls.push(url);
+      if (url.endsWith('/commits?sha=eriks-esm&per_page=1')) {
+        return [
+          {
+            sha: '9999999abcdef',
+            commit: {
+              committer: {
+                date: '2025-12-01T00:00:00Z',
+              },
+            },
+          },
+        ];
+      }
+      return {
+        sha: 'abcdef1234567890',
+        commit: {
+          committer: {
+            date: '2025-11-01T12:34:56Z',
+          },
+        },
+      };
+    },
+    null,
+    packageLock
+  );
+
+  assert.deepEqual(seenUrls, [
+    'https://api.github.com/repos/EriksRemess/express/commits/abcdef1234567890',
+    'https://api.github.com/repos/EriksRemess/express/commits?sha=eriks-esm&per_page=1',
+  ]);
+  assert.equal(results.get('express').latestRef.ref, 'eriks-esm');
+  assert.equal(formatInstalledVersion('1.0.0', results.get('express')), 'abcdef1');
+  assert.equal(formatLatestVersion(null, results.get('express')), '9999999');
+});
+
+test('collectGitHubPackageInfoByPackage includes SHA for installed display', async () => {
+  const topDeps = {
+    githubDep: {
+      wanted: 'github:octo/example#main',
+    },
+  };
+  const tree = {
+    dependencies: {
+      githubDep: {
+        version: '1.0.0',
+      },
+    },
+  };
+
+  const results = await collectGitHubPackageInfoByPackage(topDeps, tree, async url => {
+    if (url.endsWith('/commits?sha=main&per_page=1')) {
+      return [
+        {
+          sha: '9999999abcdef',
+          commit: {
+            committer: {
+              date: '2025-12-01T00:00:00Z',
+            },
+          },
+        },
+      ];
+    }
+    return {
+      sha: 'abcdef1234567890',
+      commit: {
+        committer: {
+          date: '2025-11-01T12:34:56Z',
+        },
+      },
+    };
+  });
+
+  assert.equal(results.get('githubDep').date, '2025-11-01T12:34:56Z');
+  assert.equal(results.get('githubDep').sha, 'abcdef1234567890');
+  assert.equal(results.get('githubDep').latestDate, '2025-12-01T00:00:00Z');
+  assert.equal(results.get('githubDep').latestSha, '9999999abcdef');
+  assert.equal(formatInstalledVersion('1.0.0', results.get('githubDep')), 'abcdef1');
+  assert.equal(formatLatestVersion('5.6.2', results.get('githubDep')), '9999999');
 });
 
 test('formatLastUpdated uses YYYY-MM-DD and fallback markers', () => {

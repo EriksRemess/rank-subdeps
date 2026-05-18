@@ -31,6 +31,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const GITHUB_API_VERSION = '2022-11-28';
 
 function readJSON(p) {
   try {
@@ -431,6 +432,399 @@ function collectLastUpdatedByPackage(root, packageNames, execRunner = execFileSy
   return byPackage;
 }
 
+function loadPackageLock(root) {
+  return readJSON(join(root, 'package-lock.json')) ?? readJSON(join(root, 'npm-shrinkwrap.json'));
+}
+
+function getPackageLockEntryForPackage(packageLock, packageName) {
+  if (!packageLock || typeof packageLock !== 'object' || typeof packageName !== 'string') return null;
+  const packages = packageLock.packages;
+  if (!packages || typeof packages !== 'object') return null;
+  return packages[`node_modules/${packageName}`] ?? null;
+}
+
+function safeDecodeURIComponent(value) {
+  const text = String(value || '');
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
+function cleanGitHubRepoName(value) {
+  return safeDecodeURIComponent(value)
+    .replace(/\.git$/i, '')
+    .replace(/\/+$/g, '');
+}
+
+function cleanGitHubRef(value) {
+  const ref = safeDecodeURIComponent(value)
+    .trim()
+    .replace(/^refs\/(?:heads|tags)\//, '');
+  if (!ref || ref.startsWith('semver:')) return null;
+  return ref;
+}
+
+function makeGitHubCommitRef(owner, repo, ref) {
+  const cleanOwner = safeDecodeURIComponent(owner).trim();
+  const cleanRepo = cleanGitHubRepoName(repo);
+  const cleanRef = cleanGitHubRef(ref);
+  if (!cleanOwner || !cleanRepo || !cleanRef) return null;
+  return { owner: cleanOwner, repo: cleanRepo, ref: cleanRef };
+}
+
+function makeGitHubRepoRef(owner, repo, ref = null) {
+  const cleanOwner = safeDecodeURIComponent(owner).trim();
+  const cleanRepo = cleanGitHubRepoName(repo);
+  const cleanRef = ref == null ? null : cleanGitHubRef(ref);
+  if (!cleanOwner || !cleanRepo || (ref != null && !cleanRef)) return null;
+  return { owner: cleanOwner, repo: cleanRepo, ref: cleanRef };
+}
+
+function parseGitHubCommitRef(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const value = raw.trim();
+
+  const archiveMatch = value.match(
+    /^https?:\/\/(?:codeload\.)?github\.com\/([^/\s#?]+)\/([^/\s#?]+)\/(?:tar\.gz|zip|tarball|zipball|archive(?:\/refs\/(?:heads|tags))?)\/([^#?\s]+)$/i
+  );
+  if (archiveMatch) return makeGitHubCommitRef(archiveMatch[1], archiveMatch[2], archiveMatch[3]);
+
+  const hashIndex = value.indexOf('#');
+  if (hashIndex === -1 || hashIndex === value.length - 1) return null;
+
+  const ref = value.slice(hashIndex + 1).split(/[?\s]/)[0];
+  const source = value.slice(0, hashIndex);
+  const patterns = [
+    /^github:([^/\s#?]+)\/([^/\s#?]+)$/i,
+    /^github\.com[:/]([^/\s#?]+)\/([^/\s#?]+)$/i,
+    /^(?:git\+)?https?:\/\/github\.com\/([^/\s#?]+)\/([^/\s#?]+)$/i,
+    /^(?:git\+)?ssh:\/\/(?:[^@/\s#?]+@)?github\.com[:/]([^/\s#?]+)\/([^/\s#?]+)$/i,
+    /^git@github\.com:([^/\s#?]+)\/([^/\s#?]+)$/i,
+    /^([^@:/\s#?]+)\/([^/\s#?]+)$/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = source.match(pattern);
+    if (match) return makeGitHubCommitRef(match[1], match[2], ref);
+  }
+
+  return null;
+}
+
+function parseGitHubRepo(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const value = raw.trim().split('#')[0];
+  const patterns = [
+    /^github:([^/\s#?]+)\/([^/\s#?]+)$/i,
+    /^github\.com[:/]([^/\s#?]+)\/([^/\s#?]+)$/i,
+    /^(?:git\+)?https?:\/\/github\.com\/([^/\s#?]+)\/([^/\s#?]+)$/i,
+    /^(?:git\+)?ssh:\/\/(?:[^@/\s#?]+@)?github\.com[:/]([^/\s#?]+)\/([^/\s#?]+)$/i,
+    /^git@github\.com:([^/\s#?]+)\/([^/\s#?]+)$/i,
+    /^([^@:/\s#?]+)\/([^/\s#?]+)$/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    if (match) {
+      const owner = safeDecodeURIComponent(match[1]).trim();
+      const repo = cleanGitHubRepoName(match[2]);
+      if (owner && repo) return { owner, repo };
+    }
+  }
+
+  return null;
+}
+
+function getGitHubCommitRefForNode(name, node, wanted, lockEntry = null) {
+  const installedPkg = node?.path ? readJSON(join(node.path, 'package.json')) : null;
+  const candidates = [
+    node?.resolved,
+    node?._resolved,
+    lockEntry?.resolved,
+    lockEntry?._resolved,
+    installedPkg?._resolved,
+    lockEntry?.version,
+    node?.version,
+    node?.from,
+    node?._from,
+    lockEntry?.from,
+    lockEntry?._from,
+    installedPkg?._from,
+    wanted,
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = parseGitHubCommitRef(candidate);
+    if (parsed) return parsed;
+  }
+
+  const sourceRepo = candidates.map(parseGitHubRepo).find(Boolean);
+  if (sourceRepo && typeof installedPkg?.gitHead === 'string') {
+    return makeGitHubCommitRef(sourceRepo.owner, sourceRepo.repo, installedPkg.gitHead);
+  }
+
+  return null;
+}
+
+function getGitHubTrackingRefForNode(name, node, wanted, lockEntry = null) {
+  const installedPkg = node?.path ? readJSON(join(node.path, 'package.json')) : null;
+  const wantedCommitRef = parseGitHubCommitRef(wanted);
+  if (wantedCommitRef) return wantedCommitRef;
+  const wantedRepo = parseGitHubRepo(wanted);
+  if (wantedRepo) return makeGitHubRepoRef(wantedRepo.owner, wantedRepo.repo);
+
+  const sourceCandidates = [
+    node?.from,
+    node?._from,
+    lockEntry?.from,
+    lockEntry?._from,
+    installedPkg?._from,
+    lockEntry?.version,
+    node?.version,
+  ];
+
+  for (const candidate of sourceCandidates) {
+    const parsed = parseGitHubCommitRef(candidate);
+    if (parsed) return parsed;
+  }
+
+  const sourceRepo = sourceCandidates.map(parseGitHubRepo).find(Boolean);
+  if (sourceRepo) return makeGitHubRepoRef(sourceRepo.owner, sourceRepo.repo);
+
+  const resolvedCandidates = [
+    node?.resolved,
+    node?._resolved,
+    lockEntry?.resolved,
+    lockEntry?._resolved,
+    installedPkg?._resolved,
+  ];
+  const resolvedRepo = resolvedCandidates.map(parseGitHubRepo).find(Boolean);
+  if (resolvedRepo) return makeGitHubRepoRef(resolvedRepo.owner, resolvedRepo.repo);
+
+  return null;
+}
+
+function parseGitHubCommitDateValue(raw) {
+  const date =
+    raw?.commit?.committer?.date ??
+    raw?.commit?.author?.date ??
+    raw?.committer?.date ??
+    raw?.author?.date ??
+    null;
+  return typeof date === 'string' && date ? date : null;
+}
+
+function parseGitHubCommitMetaValue(raw) {
+  const sha = typeof raw?.sha === 'string' && raw.sha ? raw.sha : null;
+  return {
+    date: parseGitHubCommitDateValue(raw),
+    sha,
+  };
+}
+
+async function requestGitHubJson(url) {
+  const headers = {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'rank-subdeps',
+    'X-GitHub-Api-Version': GITHUB_API_VERSION,
+  };
+  if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    throw new Error(`GitHub request failed with ${response.status}`);
+  }
+  return response.json();
+}
+
+async function runGitHubCommitMeta(githubRef, jsonRequester = requestGitHubJson) {
+  if (!githubRef) return { date: null, sha: null };
+  const owner = encodeURIComponent(githubRef.owner);
+  const repo = encodeURIComponent(githubRef.repo);
+  const ref = encodeURIComponent(githubRef.ref);
+  const url = `https://api.github.com/repos/${owner}/${repo}/commits/${ref}`;
+  try {
+    const json = await jsonRequester(url);
+    return parseGitHubCommitMetaValue(json);
+  } catch {
+    return { date: null, sha: null };
+  }
+}
+
+async function runGitHubLatestCommitMeta(githubRef, jsonRequester = requestGitHubJson) {
+  if (!githubRef) return { date: null, sha: null };
+  const owner = encodeURIComponent(githubRef.owner);
+  const repo = encodeURIComponent(githubRef.repo);
+  const sha = githubRef.ref ? `sha=${encodeURIComponent(githubRef.ref)}&` : '';
+  const url = `https://api.github.com/repos/${owner}/${repo}/commits?${sha}per_page=1`;
+  try {
+    const json = await jsonRequester(url);
+    return parseGitHubCommitMetaValue(Array.isArray(json) ? json[0] : json);
+  } catch {
+    return { date: null, sha: null };
+  }
+}
+
+async function runGitHubCommitDate(githubRef, jsonRequester = requestGitHubJson) {
+  return (await runGitHubCommitMeta(githubRef, jsonRequester)).date;
+}
+
+function getShortGitHubHash(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return /^[0-9a-f]{7,40}$/i.test(trimmed) ? trimmed.slice(0, 7) : null;
+}
+
+function formatInstalledVersion(installedVersion, githubInfo = null) {
+  const shortHash = getShortGitHubHash(githubInfo?.sha) ?? getShortGitHubHash(githubInfo?.githubRef?.ref);
+  return shortHash ?? installedVersion ?? 'UNKNOWN';
+}
+
+function formatLatestVersion(latestVersion, githubInfo = null) {
+  if (githubInfo) return getShortGitHubHash(githubInfo.latestSha) ?? '?';
+  return latestVersion ?? '?';
+}
+
+function parseSemver(value) {
+  if (typeof value !== 'string') return null;
+  const match = value.trim().match(
+    /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/
+  );
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4] ? match[4].split('.') : [],
+  };
+}
+
+function comparePrereleaseIdentifiers(a, b) {
+  const aNumeric = /^\d+$/.test(a);
+  const bNumeric = /^\d+$/.test(b);
+  if (aNumeric && bNumeric) return Number(a) - Number(b);
+  if (aNumeric) return -1;
+  if (bNumeric) return 1;
+  return a.localeCompare(b);
+}
+
+function compareSemverVersions(a, b) {
+  const parsedA = parseSemver(a);
+  const parsedB = parseSemver(b);
+  if (!parsedA || !parsedB) return null;
+
+  for (const key of ['major', 'minor', 'patch']) {
+    if (parsedA[key] !== parsedB[key]) return parsedA[key] - parsedB[key];
+  }
+
+  if (parsedA.prerelease.length === 0 && parsedB.prerelease.length === 0) return 0;
+  if (parsedA.prerelease.length === 0) return 1;
+  if (parsedB.prerelease.length === 0) return -1;
+
+  const maxLen = Math.max(parsedA.prerelease.length, parsedB.prerelease.length);
+  for (let idx = 0; idx < maxLen; idx++) {
+    const aPart = parsedA.prerelease[idx];
+    const bPart = parsedB.prerelease[idx];
+    if (aPart === undefined) return -1;
+    if (bPart === undefined) return 1;
+    const diff = comparePrereleaseIdentifiers(aPart, bPart);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+function compareLatestToInstalled(latest, installed, githubInfo = null) {
+  if (!latest || latest === '?' || !installed || installed === 'UNKNOWN' || installed === 'NOT INSTALLED') {
+    return null;
+  }
+
+  if (githubInfo) {
+    const latestHash = getShortGitHubHash(githubInfo.latestSha);
+    const installedHash = getShortGitHubHash(githubInfo.sha) ?? getShortGitHubHash(githubInfo.githubRef?.ref);
+    if (latestHash && installedHash && latestHash === installedHash) return 'same';
+
+    const latestTs = getPublishTimestamp(githubInfo.latestDate);
+    const installedTs = getPublishTimestamp(githubInfo.date);
+    if (latestTs != null && installedTs != null) {
+      if (latestTs > installedTs) return 'newer';
+      if (latestTs < installedTs) return 'older';
+    }
+
+    if (latestHash && installedHash && latestHash !== installedHash) return 'different';
+    return null;
+  }
+
+  if (latest === installed) return 'same';
+  const semverComparison = compareSemverVersions(latest, installed);
+  if (semverComparison == null) return 'different';
+  if (semverComparison > 0) return 'newer';
+  if (semverComparison < 0) return 'older';
+  return 'different';
+}
+
+function formatLatestWithStatus(latest, latestStatus) {
+  if (!latestStatus || latestStatus === 'same') return latest ?? '?';
+  return `${latest ?? '?'} (${latestStatus})`;
+}
+
+async function collectGitHubPackageInfoByPackage(
+  topDeps,
+  tree,
+  jsonRequester = requestGitHubJson,
+  onProgress = null,
+  packageLock = null
+) {
+  const entries = [];
+  for (const [name, meta] of Object.entries(topDeps)) {
+    const node = tree.dependencies?.[name];
+    if (!node) continue;
+    const lockEntry = getPackageLockEntryForPackage(packageLock, name);
+    const githubRef = getGitHubCommitRefForNode(name, node, meta.wanted, lockEntry);
+    const latestRef = getGitHubTrackingRefForNode(name, node, meta.wanted, lockEntry) ?? githubRef;
+    if (githubRef) entries.push({ name, githubRef, latestRef });
+  }
+
+  const byPackage = new Map();
+  for (let idx = 0; idx < entries.length; idx++) {
+    const { name, githubRef, latestRef } = entries[idx];
+    onProgress?.({ current: idx + 1, total: entries.length, packageName: name });
+    const commitMeta = await runGitHubCommitMeta(githubRef, jsonRequester);
+    const latestCommitMeta = await runGitHubLatestCommitMeta(latestRef, jsonRequester);
+    byPackage.set(name, {
+      githubRef,
+      latestRef,
+      date: commitMeta.date,
+      sha: commitMeta.sha ?? (getShortGitHubHash(githubRef.ref) ? githubRef.ref : null),
+      latestDate: latestCommitMeta.date,
+      latestSha: latestCommitMeta.sha,
+    });
+  }
+  return byPackage;
+}
+
+async function collectGitHubCommitDatesByPackage(
+  topDeps,
+  tree,
+  jsonRequester = requestGitHubJson,
+  onProgress = null,
+  packageLock = null
+) {
+  const packageInfoByPackage = await collectGitHubPackageInfoByPackage(
+    topDeps,
+    tree,
+    jsonRequester,
+    onProgress,
+    packageLock
+  );
+  const byPackage = new Map();
+  for (const [name, info] of packageInfoByPackage.entries()) {
+    if (info.date) byPackage.set(name, info.date);
+  }
+  return byPackage;
+}
+
 const makeId = (name, version) => `${name}@${version || 'UNKNOWN'}`;
 
 function getApproxPathSize(path, pathSizeCache) {
@@ -801,7 +1195,7 @@ function parseArgs(argv) {
 function printHelpAndExit(code = 0) {
   console.log(`rank-subdeps
 
-Rank top-level dependencies by unique transitive subdependencies, latest publish date, and approximate file size.
+Rank top-level dependencies by unique transitive subdependencies, latest update date, and approximate file size.
 
 Usage:
   rank-subdeps [--json] [--top N] [--sort subdeps|size|name|publish] [--direction asc|desc] [--omit=<type>[,<type>]] [--include=<type>[,<type>]]
@@ -809,7 +1203,7 @@ Usage:
 Options:
   --json        Output machine-readable JSON instead of a table (includes latest, lastUpdated, auditSubdeps, and aggregateApproxBytes)
   --top N       Number of items to include in the "Top N" summary (default: 10)
-  --sort        Sort by subdeps, size, name, or publish date
+  --sort        Sort by subdeps, size, name, or update date
   --direction   Sort direction for selected --sort: asc or desc
   --omit        Dependency types to omit: dev, optional, peer (can be repeated)
   --include     Dependency types to include even if omitted (can be repeated)
@@ -862,6 +1256,7 @@ async function main(argv = process.argv) {
   const args = parseArgs(argv);
   const root = process.cwd();
   const pkg = loadPkgJson(root);
+  const packageLock = loadPackageLock(root);
   const progress = createProgressReporter({
     enabled: !args.json && !!process.stderr.isTTY,
   });
@@ -927,6 +1322,15 @@ async function main(argv = process.argv) {
         progress.update(`Fetching package metadata (${current}/${total})`);
       }
     );
+    const githubPackageInfoByPackage = await collectGitHubPackageInfoByPackage(
+      topDeps,
+      tree,
+      requestGitHubJson,
+      ({ current, total }) => {
+        progress.update(`Fetching GitHub commit dates (${current}/${total})`);
+      },
+      packageLock
+    );
 
     progress.update('Building results');
     results = [];
@@ -936,13 +1340,17 @@ async function main(argv = process.argv) {
       const types = ['prod', 'dev', 'optional', 'peer'].filter(t => meta.types.has(t));
       const node = tree.dependencies?.[name];
       const packageMeta = packageMetaByPackage.get(name) ?? { latest: null, lastUpdated: null };
+      const githubInfo = githubPackageInfoByPackage.get(name) ?? null;
+      const lastUpdated = githubInfo?.date ?? packageMeta.lastUpdated ?? null;
+      const latest = formatLatestVersion(packageMeta.latest, githubInfo);
       if (!node) {
         results.push({
           name,
           wanted: meta.wanted,
-          latest: packageMeta.latest,
+          latest,
           installed: 'NOT INSTALLED',
-          lastUpdated: packageMeta.lastUpdated ?? null,
+          latestStatus: null,
+          lastUpdated,
           types,
           subdeps: 0,
           outdatedSubdeps: outdatedCountsAvailable ? 0 : null,
@@ -954,12 +1362,14 @@ async function main(argv = process.argv) {
       }
 
       const stats = collectSubtreeStats(name, node, pathSizeCache, outdatedMarkers, auditMarkers);
+      const installed = formatInstalledVersion(node.version, githubInfo);
       results.push({
         name,
         wanted: meta.wanted,
-        latest: packageMeta.latest,
-        installed: node.version || 'UNKNOWN',
-        lastUpdated: packageMeta.lastUpdated ?? null,
+        latest,
+        installed,
+        latestStatus: compareLatestToInstalled(latest, installed, githubInfo),
+        lastUpdated,
         types,
         subdeps: stats.subdeps,
         outdatedSubdeps: outdatedCountsAvailable ? stats.outdatedSubdeps : null,
@@ -988,7 +1398,7 @@ async function main(argv = process.argv) {
     'wanted',
     'latest',
     'installed',
-    'last published',
+    'last updated',
     'types',
     'subdeps',
     'outdated',
@@ -1002,7 +1412,7 @@ async function main(argv = process.argv) {
       String(idx + 1),
       r.name,
       r.wanted,
-      r.latest ?? '?',
+      formatLatestWithStatus(r.latest, r.latestStatus),
       r.installed,
       formatLastUpdated(r.lastUpdated),
       r.types.join(','),
@@ -1057,7 +1467,7 @@ async function main(argv = process.argv) {
       : args.sort === 'name'
         ? `name (${effectiveDirection})`
         : args.sort === 'publish'
-          ? `publish date (${effectiveDirection})`
+          ? `update date (${effectiveDirection})`
           : `subdependencies (${effectiveDirection})`;
   console.log(`\nTop ${args.top} by ${topLabel}:`);
   topN.forEach((r, i) => {
@@ -1090,18 +1500,33 @@ if (shouldRunAsCli(thisFile, process.argv[1])) {
 
 export {
   collectAuditMarkers,
+  collectGitHubCommitDatesByPackage,
+  collectGitHubPackageInfoByPackage,
   collectLastUpdatedByPackage,
   collectPackageMetaByPackage,
   collectAggregateApproxBytes,
   collectOutdatedMarkers,
   collectSubtreeStats,
+  compareLatestToInstalled,
+  compareSemverVersions,
   formatApproxBytes,
+  formatInstalledVersion,
+  formatLatestVersion,
+  formatLatestWithStatus,
   formatLastUpdated,
   getApproxPathSize,
+  getGitHubCommitRefForNode,
+  getGitHubTrackingRefForNode,
   getResultsComparator,
   isOutdatedNode,
   main,
+  parseGitHubCommitMetaValue,
+  parseGitHubCommitRef,
+  parseGitHubCommitDateValue,
   parseArgs,
+  runGitHubCommitDate,
+  runGitHubCommitMeta,
+  runGitHubLatestCommitMeta,
   runNpmLs,
   runNpmAudit,
   runNpmOutdated,

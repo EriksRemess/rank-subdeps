@@ -1,6 +1,6 @@
 # rank-subdeps
 
-Rank your top-level dependencies by how many transitive subdependencies they bring in, how many of those are outdated, how many have audit issues (with severity), the latest available direct version, when direct dependencies were last published, and their approximate aggregate file size.
+Rank your top-level dependencies by how many transitive subdependencies they bring in, how many of those are outdated, how many have audit issues (with severity), the latest available direct version, when direct dependencies were last updated, and their approximate aggregate file size.
 
 ## Install
 
@@ -20,9 +20,9 @@ rank-subdeps
 
 | Flag | Description |
 |------|--------------|
-| `--json` | Output machine-readable JSON (includes `latest`, `outdatedSubdeps`, `auditSubdeps`, and `lastUpdated` (latest publish time) per result) |
+| `--json` | Output machine-readable JSON (includes `latest`, `latestStatus`, `outdatedSubdeps`, `auditSubdeps`, and `lastUpdated` (latest publish time or GitHub commit time) per result) |
 | `--top N` | Show a “Top N” summary (default: 10) |
-| `--sort subdeps\|size\|name\|publish` | Sort by subdependency count, approximate size, package name, or publish date |
+| `--sort subdeps\|size\|name\|publish` | Sort by subdependency count, approximate size, package name, or update date |
 | `--direction asc\|desc` | Sort direction for the selected `--sort` field (defaults: `subdeps/size/publish=desc`, `name=asc`) |
 | `--omit=<type>[,<type>]` | Omit dependency types: `dev`, `optional`, `peer` |
 | `--include=<type>[,<type>]` | Include dependency types even if omitted |
@@ -31,8 +31,8 @@ rank-subdeps
 ### Example output
 
 ```
-#  name          wanted  latest  installed  last published  types  subdeps  outdated  audit         approx size
--  ------------- ------- ------- ---------- --------------  ------ -------  --------  ------------  -----------
+#  name          wanted  latest  installed  last updated  types  subdeps  outdated  audit         approx size
+-  ------------- ------- ------- ---------- ------------  ------ -------  --------  ------------  -----------
 1  express       ^4.19.2 4.21.0  4.19.2     2025-12-01      prod   69       12        4 (critical)  ~2.8 MB
 2  typescript    ^5.6.2  5.6.2   5.6.2      2025-10-10      dev    10       0         0             ~23 MB
 3  chalk         ^5.3.0  5.6.2   5.3.0      2025-09-08      prod   2        1         1 (moderate)  ~94 KB
@@ -62,7 +62,11 @@ It also counts how many unique transitive subdependencies in each subtree are ou
 
 It also counts unique transitive subdependencies with `npm audit` findings and shows the highest severity per subtree in the `audit` column.
 
-The `last published` column is sourced from the publish timestamp of each direct dependency's npm `latest` dist-tag version.
+The `latest` and `installed` columns show package versions for registry packages. For GitHub-installed direct dependencies, `latest` shows the short hash for the latest commit on the requested GitHub ref or branch, and `installed` shows the short hash for the installed commit when available.
+
+When `latest` and `installed` differ, the table marks `latest` as `(newer)`, `(older)`, or `(different)`. Registry packages are compared with semver ordering; GitHub packages are compared by commit dates when available, otherwise by hash difference.
+
+The `last updated` column is sourced from the publish timestamp of each direct dependency's npm `latest` dist-tag version. When a direct dependency is installed from a GitHub URL or shorthand with a commit/ref, the CLI tries GitHub's commits API and uses that commit's timestamp instead. If `GITHUB_TOKEN` is set, it is sent with those GitHub requests.
 
 Approximate file size is derived from installed package files under `node_modules` and deduped by `(name@version)`.
 
