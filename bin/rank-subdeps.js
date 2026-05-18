@@ -5,6 +5,7 @@
 // Usage:
 //   rank-subdeps
 //   rank-subdeps --json
+//   rank-subdeps --verbose
 //   rank-subdeps --top 20
 //   rank-subdeps --omit=dev
 //   rank-subdeps --omit=dev,optional --include=optional
@@ -423,6 +424,13 @@ function createProgressReporter({ enabled = false, stream = process.stderr } = {
   };
 }
 
+function createVerboseLogger({ enabled = false, stream = process.stderr } = {}) {
+  return message => {
+    if (!enabled) return;
+    stream.write(`[rank-subdeps] ${message}\n`);
+  };
+}
+
 function collectLastUpdatedByPackage(root, packageNames, execRunner = execFileSync) {
   const byPackage = new Map();
   const packageMetaByPackage = collectPackageMetaByPackage(root, packageNames, execRunner);
@@ -634,35 +642,44 @@ async function requestGitHubJson(url) {
 
   const response = await fetch(url, { headers });
   if (!response.ok) {
-    throw new Error(`GitHub request failed with ${response.status}`);
+    let body = '';
+    try {
+      body = await response.text();
+    } catch {}
+    const detail = body ? `: ${body.slice(0, 200)}` : '';
+    throw new Error(`GitHub request failed with ${response.status}${detail}`);
   }
   return response.json();
 }
 
-async function runGitHubCommitMeta(githubRef, jsonRequester = requestGitHubJson) {
+async function runGitHubCommitMeta(githubRef, jsonRequester = requestGitHubJson, onVerbose = null) {
   if (!githubRef) return { date: null, sha: null };
   const owner = encodeURIComponent(githubRef.owner);
   const repo = encodeURIComponent(githubRef.repo);
   const ref = encodeURIComponent(githubRef.ref);
   const url = `https://api.github.com/repos/${owner}/${repo}/commits/${ref}`;
+  onVerbose?.(`GitHub request: ${url}`);
   try {
     const json = await jsonRequester(url);
     return parseGitHubCommitMetaValue(json);
-  } catch {
+  } catch (err) {
+    onVerbose?.(`GitHub request failed: ${url}: ${err?.message ?? String(err)}`);
     return { date: null, sha: null };
   }
 }
 
-async function runGitHubLatestCommitMeta(githubRef, jsonRequester = requestGitHubJson) {
+async function runGitHubLatestCommitMeta(githubRef, jsonRequester = requestGitHubJson, onVerbose = null) {
   if (!githubRef) return { date: null, sha: null };
   const owner = encodeURIComponent(githubRef.owner);
   const repo = encodeURIComponent(githubRef.repo);
   const sha = githubRef.ref ? `sha=${encodeURIComponent(githubRef.ref)}&` : '';
   const url = `https://api.github.com/repos/${owner}/${repo}/commits?${sha}per_page=1`;
+  onVerbose?.(`GitHub request: ${url}`);
   try {
     const json = await jsonRequester(url);
     return parseGitHubCommitMetaValue(Array.isArray(json) ? json[0] : json);
-  } catch {
+  } catch (err) {
+    onVerbose?.(`GitHub request failed: ${url}: ${err?.message ?? String(err)}`);
     return { date: null, sha: null };
   }
 }
@@ -683,7 +700,9 @@ function formatInstalledVersion(installedVersion, githubInfo = null) {
 }
 
 function formatLatestVersion(latestVersion, githubInfo = null) {
-  if (githubInfo) return getShortGitHubHash(githubInfo.latestSha) ?? '?';
+  if (githubInfo) {
+    return getShortGitHubHash(githubInfo.latestSha) ?? getShortGitHubHash(githubInfo.latestRef?.ref) ?? githubInfo.latestRef?.ref ?? '?';
+  }
   return latestVersion ?? '?';
 }
 
@@ -769,12 +788,18 @@ function formatLatestWithStatus(latest, latestStatus) {
   return `${latest ?? '?'} (${latestStatus})`;
 }
 
+function formatGitHubRef(githubRef) {
+  if (!githubRef) return '?';
+  return `${githubRef.owner}/${githubRef.repo}${githubRef.ref ? `#${githubRef.ref}` : ''}`;
+}
+
 async function collectGitHubPackageInfoByPackage(
   topDeps,
   tree,
   jsonRequester = requestGitHubJson,
   onProgress = null,
-  packageLock = null
+  packageLock = null,
+  onVerbose = null
 ) {
   const entries = [];
   for (const [name, meta] of Object.entries(topDeps)) {
@@ -783,15 +808,20 @@ async function collectGitHubPackageInfoByPackage(
     const lockEntry = getPackageLockEntryForPackage(packageLock, name);
     const githubRef = getGitHubCommitRefForNode(name, node, meta.wanted, lockEntry);
     const latestRef = getGitHubTrackingRefForNode(name, node, meta.wanted, lockEntry) ?? githubRef;
-    if (githubRef) entries.push({ name, githubRef, latestRef });
+    if (githubRef) {
+      onVerbose?.(`${name}: GitHub installed ref ${formatGitHubRef(githubRef)}`);
+      onVerbose?.(`${name}: GitHub latest ref ${formatGitHubRef(latestRef)}`);
+      entries.push({ name, githubRef, latestRef });
+    }
   }
+  onVerbose?.(`GitHub packages detected: ${entries.length}`);
 
   const byPackage = new Map();
   for (let idx = 0; idx < entries.length; idx++) {
     const { name, githubRef, latestRef } = entries[idx];
     onProgress?.({ current: idx + 1, total: entries.length, packageName: name });
-    const commitMeta = await runGitHubCommitMeta(githubRef, jsonRequester);
-    const latestCommitMeta = await runGitHubLatestCommitMeta(latestRef, jsonRequester);
+    const commitMeta = await runGitHubCommitMeta(githubRef, jsonRequester, onVerbose);
+    const latestCommitMeta = await runGitHubLatestCommitMeta(latestRef, jsonRequester, onVerbose);
     byPackage.set(name, {
       githubRef,
       latestRef,
@@ -800,6 +830,12 @@ async function collectGitHubPackageInfoByPackage(
       latestDate: latestCommitMeta.date,
       latestSha: latestCommitMeta.sha,
     });
+    onVerbose?.(
+      `${name}: installed commit ${getShortGitHubHash(commitMeta.sha) ?? getShortGitHubHash(githubRef.ref) ?? '?'} (${commitMeta.date ?? '?'})`
+    );
+    onVerbose?.(
+      `${name}: latest commit ${getShortGitHubHash(latestCommitMeta.sha) ?? '?'} (${latestCommitMeta.date ?? '?'})`
+    );
   }
   return byPackage;
 }
@@ -1102,6 +1138,7 @@ const pad = (str, len) => {
 function parseArgs(argv) {
   const args = {
     json: false,
+    verbose: false,
     top: 10,
     sort: 'subdeps',
     direction: null,
@@ -1134,6 +1171,8 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '--json') {
       args.json = true;
+    } else if (a === '-v' || a === '--verbose') {
+      args.verbose = true;
     } else if (a === '--sort' || a.startsWith('--sort=')) {
       const raw = a === '--sort' ? argv[i + 1] : a.slice('--sort='.length);
       if (!raw || raw.startsWith('-')) {
@@ -1198,10 +1237,11 @@ function printHelpAndExit(code = 0) {
 Rank top-level dependencies by unique transitive subdependencies, latest update date, and approximate file size.
 
 Usage:
-  rank-subdeps [--json] [--top N] [--sort subdeps|size|name|publish] [--direction asc|desc] [--omit=<type>[,<type>]] [--include=<type>[,<type>]]
+  rank-subdeps [--json] [--verbose] [--top N] [--sort subdeps|size|name|publish] [--direction asc|desc] [--omit=<type>[,<type>]] [--include=<type>[,<type>]]
 
 Options:
   --json        Output machine-readable JSON instead of a table (includes latest, lastUpdated, auditSubdeps, and aggregateApproxBytes)
+  -v, --verbose Print diagnostic details to stderr
   --top N       Number of items to include in the "Top N" summary (default: 10)
   --sort        Sort by subdeps, size, name, or update date
   --direction   Sort direction for selected --sort: asc or desc
@@ -1257,9 +1297,16 @@ async function main(argv = process.argv) {
   const root = process.cwd();
   const pkg = loadPkgJson(root);
   const packageLock = loadPackageLock(root);
+  const verbose = createVerboseLogger({ enabled: args.verbose });
   const progress = createProgressReporter({
-    enabled: !args.json && !!process.stderr.isTTY,
+    enabled: !args.json && !args.verbose && !!process.stderr.isTTY,
   });
+
+  verbose(`root: ${root}`);
+  verbose(`package: ${pkg.name ?? '(unnamed)'}`);
+  verbose(`package lock: ${packageLock ? 'found' : 'not found'}`);
+  verbose(`omit: ${Array.from(args.omit).sort().join(',') || '(none)'}`);
+  verbose(`include: ${Array.from(args.include).sort().join(',') || '(none)'}`);
 
   progress.start('Inspecting dependency tree');
 
@@ -1270,10 +1317,13 @@ async function main(argv = process.argv) {
 
   try {
     const tree = await runNpmLsAsync(root, args);
+    verbose(`npm ls packages: ${Object.keys(tree.dependencies ?? {}).length}`);
     progress.update('Checking outdated packages');
     const outdatedJson = await runNpmOutdatedAsync(root, args);
+    verbose(`outdated counts: ${outdatedJson === null ? 'unavailable' : 'available'}`);
     progress.update('Checking audit issues');
     const auditJson = await runNpmAuditAsync(root, args);
+    verbose(`audit counts: ${auditJson === null ? 'unavailable' : 'available'}`);
     const outdatedMarkers = collectOutdatedMarkers(root, outdatedJson);
     const auditMarkers = collectAuditMarkers(root, auditJson);
     outdatedCountsAvailable = outdatedJson !== null;
@@ -1315,6 +1365,7 @@ async function main(argv = process.argv) {
     }
 
     const topDepNames = Object.keys(topDeps);
+    verbose(`top-level dependencies: ${topDepNames.length}`);
     const packageMetaByPackage = await collectPackageMetaByPackageAsync(
       root,
       topDepNames,
@@ -1329,7 +1380,8 @@ async function main(argv = process.argv) {
       ({ current, total }) => {
         progress.update(`Fetching GitHub commit dates (${current}/${total})`);
       },
-      packageLock
+      packageLock,
+      verbose
     );
 
     progress.update('Building results');
@@ -1380,7 +1432,9 @@ async function main(argv = process.argv) {
     }
 
     results.sort(getResultsComparator(args.sort, args.direction));
+    verbose(`results: ${results.length}`);
     aggregateApproxBytes = collectAggregateApproxBytes(tree, topDepNames, pathSizeCache);
+    verbose(`aggregate approx bytes: ${aggregateApproxBytes}`);
   } finally {
     progress.stop();
   }

@@ -21,6 +21,7 @@ rank-subdeps
 | Flag | Description |
 |------|--------------|
 | `--json` | Output machine-readable JSON (includes `latest`, `latestStatus`, `outdatedSubdeps`, `auditSubdeps`, and `lastUpdated` (latest publish time or GitHub commit time) per result) |
+| `-v, --verbose` | Print diagnostic details to stderr, including GitHub refs, commit hashes, dates, and lookup counts |
 | `--top N` | Show a “Top N” summary (default: 10) |
 | `--sort subdeps\|size\|name\|publish` | Sort by subdependency count, approximate size, package name, or update date |
 | `--direction asc\|desc` | Sort direction for the selected `--sort` field (defaults: `subdeps/size/publish=desc`, `name=asc`) |

@@ -500,6 +500,23 @@ test('runGitHubLatestCommitMeta requests latest GitHub commit list entry', async
   assert.deepEqual(meta, { date: '2025-12-01T00:00:00Z', sha: '9999999abcdef' });
 });
 
+test('runGitHubLatestCommitMeta reports verbose request failures', async () => {
+  const messages = [];
+  const meta = await runGitHubLatestCommitMeta(
+    { owner: 'octo', repo: 'example', ref: 'main' },
+    async () => {
+      throw new Error('rate limit');
+    },
+    message => messages.push(message)
+  );
+
+  assert.deepEqual(meta, { date: null, sha: null });
+  assert.deepEqual(messages, [
+    'GitHub request: https://api.github.com/repos/octo/example/commits?sha=main&per_page=1',
+    'GitHub request failed: https://api.github.com/repos/octo/example/commits?sha=main&per_page=1: rate limit',
+  ]);
+});
+
 test('formatInstalledVersion uses a short hash for GitHub packages', () => {
   assert.equal(formatInstalledVersion('1.0.0', { sha: 'abcdef1234567890' }), 'abcdef1');
   assert.equal(formatInstalledVersion('1.0.0', { githubRef: { ref: 'deadbeef' } }), 'deadbee');
@@ -509,6 +526,8 @@ test('formatInstalledVersion uses a short hash for GitHub packages', () => {
 
 test('formatLatestVersion uses latest commit hash for GitHub packages', () => {
   assert.equal(formatLatestVersion('5.6.2', { latestSha: '9999999abcdef' }), '9999999');
+  assert.equal(formatLatestVersion('5.6.2', { latestSha: null, latestRef: { ref: 'eriks-esm' } }), 'eriks-esm');
+  assert.equal(formatLatestVersion('5.6.2', { latestSha: null, latestRef: { ref: 'a70e4d3abcdef' } }), 'a70e4d3');
   assert.equal(formatLatestVersion('5.6.2', { latestSha: null }), '?');
   assert.equal(formatLatestVersion('5.6.2', null), '5.6.2');
 });
@@ -695,6 +714,70 @@ test('collectGitHubPackageInfoByPackage checks latest commit on requested branch
   assert.equal(formatLatestVersion(null, results.get('express')), '9999999');
 });
 
+test('collectGitHubPackageInfoByPackage reports verbose GitHub diagnostics', async () => {
+  const topDeps = {
+    express: {
+      wanted: 'github:EriksRemess/express#eriks-esm',
+    },
+  };
+  const tree = {
+    dependencies: {
+      express: {
+        version: '1.0.0',
+      },
+    },
+  };
+  const packageLock = {
+    packages: {
+      'node_modules/express': {
+        version: '1.0.0',
+        resolved: 'git+https://github.com/EriksRemess/express.git#ee84143abcdef',
+      },
+    },
+  };
+  const messages = [];
+
+  await collectGitHubPackageInfoByPackage(
+    topDeps,
+    tree,
+    async url => {
+      if (url.endsWith('/commits?sha=eriks-esm&per_page=1')) {
+        return [
+          {
+            sha: 'a70e4d3abcdef',
+            commit: {
+              committer: {
+                date: '2025-12-01T00:00:00Z',
+              },
+            },
+          },
+        ];
+      }
+      return {
+        sha: 'ee84143abcdef',
+        commit: {
+          committer: {
+            date: '2025-11-01T12:34:56Z',
+          },
+        },
+      };
+    },
+    null,
+    packageLock,
+    message => messages.push(message)
+  );
+
+  assert.deepEqual(messages, [
+    'express: GitHub installed ref EriksRemess/express#ee84143abcdef',
+    'express: GitHub latest ref EriksRemess/express#eriks-esm',
+    'GitHub packages detected: 1',
+    'GitHub request: https://api.github.com/repos/EriksRemess/express/commits/ee84143abcdef',
+    'GitHub request: https://api.github.com/repos/EriksRemess/express/commits?sha=eriks-esm&per_page=1',
+    'express: installed commit ee84143 (2025-11-01T12:34:56Z)',
+    'express: latest commit a70e4d3 (2025-12-01T00:00:00Z)',
+  ]);
+});
+
 test('collectGitHubPackageInfoByPackage includes SHA for installed display', async () => {
   const topDeps = {
     githubDep: {
@@ -749,6 +832,8 @@ test('formatLastUpdated uses YYYY-MM-DD and fallback markers', () => {
 test('parseArgs supports sort + universal direction, with legacy publish aliases', () => {
   const withEquals = parseArgs(['node', 'rank-subdeps.js', '--sort=size']);
   const withSpace = parseArgs(['node', 'rank-subdeps.js', '--sort', 'name']);
+  const verboseLong = parseArgs(['node', 'rank-subdeps.js', '--verbose']);
+  const verboseShort = parseArgs(['node', 'rank-subdeps.js', '-v']);
   const publishAsc = parseArgs(['node', 'rank-subdeps.js', '--sort=publish', '--direction=asc']);
   const publishDesc = parseArgs(['node', 'rank-subdeps.js', '--sort', 'publish', '--direction', 'desc']);
   const legacyPublishAsc = parseArgs(['node', 'rank-subdeps.js', '--sort=publish-asc']);
@@ -759,6 +844,8 @@ test('parseArgs supports sort + universal direction, with legacy publish aliases
   assert.equal(withEquals.direction, null);
   assert.equal(withSpace.sort, 'name');
   assert.equal(withSpace.direction, null);
+  assert.equal(verboseLong.verbose, true);
+  assert.equal(verboseShort.verbose, true);
   assert.equal(publishAsc.sort, 'publish');
   assert.equal(publishAsc.direction, 'asc');
   assert.equal(publishDesc.sort, 'publish');
